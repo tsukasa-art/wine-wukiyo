@@ -114,25 +114,37 @@ BOOL swingby_inject_snap_file(const D3DLOCKED_RECT *lr, UINT dst_w, UINT dst_h)
     FILE *snap_f = fopen("Z:\\tmp\\melammu_snap.bgra", "rb");
     uint32_t fw = 0, fh = 0, fs = 0;
     UINT copy_w, copy_h, y;
+    long file_size, need;
     BOOL ok = FALSE;
 
     if (!snap_f)
         return FALSE;
+    /* fs is bounded above so every row offset (12 + y*fs) stays well inside a
+     * 32-bit long (PE CRT fseek): 16384 rows * 65536 stride = 2^30. */
     if (fread(&fw, 4, 1, snap_f) == 1 && fread(&fh, 4, 1, snap_f) == 1
             && fread(&fs, 4, 1, snap_f) == 1
-            && fw && fh && fw <= 16384 && fh <= 16384 && fs >= fw * 4)
+            && fw && fh && fw <= 16384 && fh <= 16384
+            && fs >= fw * 4 && fs <= 16384u * 4)
     {
         copy_w = fw < dst_w ? fw : dst_w;
         copy_h = fh < dst_h ? fh : dst_h;
-        ok = TRUE;
-        for (y = 0; y < copy_h; y++)
+        /* Validate the payload we are about to read is fully present BEFORE
+         * touching the destination, so a truncated or stale file (e.g. a
+         * pre-b6aff9ef pitch-stride header over packed rows) is rejected
+         * outright instead of partially overwriting the surface. */
+        need = 12 + (long)(copy_h - 1) * (long)fs + (long)copy_w * 4;
+        if (fseek(snap_f, 0, SEEK_END) == 0 && (file_size = ftell(snap_f)) >= need)
         {
-            BYTE *dst_row = (BYTE *)lr->pBits + (SIZE_T)y * lr->Pitch;
-            if (fseek(snap_f, 12 + (long)y * (long)fs, SEEK_SET)
-                    || fread(dst_row, 1, (size_t)copy_w * 4, snap_f) < (size_t)copy_w * 4)
+            ok = TRUE;
+            for (y = 0; y < copy_h; y++)
             {
-                ok = FALSE;
-                break;
+                BYTE *dst_row = (BYTE *)lr->pBits + (SIZE_T)y * lr->Pitch;
+                if (fseek(snap_f, 12 + (long)y * (long)fs, SEEK_SET)
+                        || fread(dst_row, 1, (size_t)copy_w * 4, snap_f) < (size_t)copy_w * 4)
+                {
+                    ok = FALSE;
+                    break;
+                }
             }
         }
     }
