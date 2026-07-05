@@ -88,7 +88,6 @@ extern void macdrv_reset_device_metrics(void);
 extern BOOL macdrv_GetDeviceGammaRamp(PHYSDEV dev, LPVOID ramp);
 extern BOOL macdrv_SetDeviceGammaRamp(PHYSDEV dev, LPVOID ramp);
 extern DWORD macdrv_GetImage(PHYSDEV dev, BITMAPINFO *info, struct gdi_image_bits *bits, struct bitblt_coords *src);
-extern DWORD macdrv_PutImage(PHYSDEV dev, HRGN clip, BITMAPINFO *info, const struct gdi_image_bits *bits, struct bitblt_coords *src, struct bitblt_coords *dst, DWORD rop);
 
 
 /**************************************************************************

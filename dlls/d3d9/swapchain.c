@@ -24,6 +24,11 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(d3d9);
 
+/* Melammu CMVS save-thumbnail capture system (device.c). */
+extern BOOL swingby_observe_only;
+extern BOOL swingby_capture_is_enabled(void);
+extern BOOL swingby_inject_snap_file(const D3DLOCKED_RECT *lr, UINT dst_w, UINT dst_h);
+
 static DWORD d3dpresentationinterval_from_wined3dswapinterval(enum wined3d_swap_interval interval)
 {
     switch (interval)
@@ -167,8 +172,11 @@ static HRESULT WINAPI d3d9_swapchain_GetFrontBufferData(IDirect3DSwapChain9Ex *i
     hr = wined3d_swapchain_get_front_buffer_data(swapchain->wined3d_swapchain, dst->wined3d_texture, dst->sub_resource_idx);
     wined3d_mutex_unlock();
 
-    /* Melammu: CG compositor path returns full macOS desktop; overwrite with game-frame snap. */
-    if (SUCCEEDED(hr))
+    /* Melammu: CG compositor path returns full macOS desktop; overwrite with game-frame snap.
+     * Gated like the device.c GetFrontBufferData path: without MELAMMU_CMVS_THUMBS this must
+     * behave exactly like stock wine (a stale snap file from the launcher or another game
+     * must not overwrite an unrelated game's front-buffer read). */
+    if (SUCCEEDED(hr) && !swingby_observe_only && swingby_capture_is_enabled())
     {
         D3DLOCKED_RECT lr;
         if (SUCCEEDED(IDirect3DSurface9_LockRect(surface, &lr, NULL, 0)))
@@ -176,17 +184,10 @@ static HRESULT WINAPI d3d9_swapchain_GetFrontBufferData(IDirect3DSwapChain9Ex *i
             wined3d_mutex_lock();
             wined3d_texture_get_sub_resource_desc(dst->wined3d_texture, dst->sub_resource_idx, &desc);
             wined3d_mutex_unlock();
-            { FILE *snap_f = fopen("Z:\\tmp\\melammu_snap.bgra", "rb");
-              if (snap_f) {
-                UINT row_bytes = desc.width * 4; UINT y;
-                for (y = 0; y < desc.height; y++) {
-                    BYTE *dst_row = (BYTE *)lr.pBits + (LONG)y * lr.Pitch;
-                    if (fread(dst_row, 1, row_bytes, snap_f) < row_bytes) break;
-                }
-                fclose(snap_f);
-                { FILE *lg = fopen("Z:\\tmp\\swingby_stretch.txt","a");
-                  if (lg){fprintf(lg,"SwapChainGetFrontBuf intercepted %ux%u\n",desc.width,desc.height);fclose(lg);} }
-              }
+            if (swingby_inject_snap_file(&lr, desc.width, desc.height))
+            {
+                FILE *lg = fopen("Z:\\tmp\\swingby_stretch.txt","a");
+                if (lg){fprintf(lg,"SwapChainGetFrontBuf intercepted %ux%u\n",desc.width,desc.height);fclose(lg);}
             }
             IDirect3DSurface9_UnlockRect(surface);
         }

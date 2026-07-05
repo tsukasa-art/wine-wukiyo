@@ -973,7 +973,8 @@ static void swingby_write_last_good_snap_file(void)
 
     w = s_last_good_width;
     h = s_last_good_height;
-    s = s_last_good_stride;
+    /* Header stride == packed row bytes (matches the rows written below). */
+    s = s_last_good_width * 4;
     fwrite(&w, 4, 1, f);
     fwrite(&h, 4, 1, f);
     fwrite(&s, 4, 1, f);

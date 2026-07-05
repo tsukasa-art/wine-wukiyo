@@ -330,23 +330,6 @@ static void free_image_bits(struct gdi_image_bits *bits)
 
 
 /***********************************************************************
- *              macdrv_PutImage
- *
- * Log when pixels are written to a macdrv DC, to diagnose CMVS thumbnail path.
- */
-DWORD macdrv_PutImage(PHYSDEV dev, HRGN clip, BITMAPINFO *info,
-                      const struct gdi_image_bits *bits, struct bitblt_coords *src,
-                      struct bitblt_coords *dst, DWORD rop)
-{
-    int w = dst->visrect.right  - dst->visrect.left;
-    int h = dst->visrect.bottom - dst->visrect.top;
-    { FILE *f = fopen("/tmp/macdrv_debug.log", "a"); if(f){ fprintf(f, "PutImage dst=%dx%d rop=%08x\n", w, h, (unsigned)rop); fclose(f); } }
-    dev = GET_NEXT_PHYSDEV(dev, pPutImage);
-    return dev->funcs->pPutImage(dev, clip, info, bits, src, dst, rop);
-}
-
-
-/***********************************************************************
  *              macdrv_GetImage
  *
  * Intercept GDI BitBlt reads from window DCs.  Wine's in-memory surface
@@ -366,10 +349,7 @@ DWORD macdrv_GetImage(PHYSDEV dev, BITMAPINFO *info,
     DWORD ret = ERROR_NOT_SUPPORTED;
     int req_w, req_h;
 
-    { FILE *f = fopen("/tmp/macdrv_debug.log", "a"); if(f){ fprintf(f, "macdrv_GetImage called hdc=%p\n", dev->hdc); fclose(f); } }
-
     hwnd = NtUserWindowFromDC(dev->hdc);
-    { FILE *f = fopen("/tmp/macdrv_debug.log", "a"); if(f){ fprintf(f, "macdrv_GetImage hwnd=%p\n", hwnd); fclose(f); } }
     if (!hwnd) goto fallback;
 
     data = get_win_data(hwnd);
@@ -383,7 +363,6 @@ DWORD macdrv_GetImage(PHYSDEV dev, BITMAPINFO *info,
     win_rect = data->rects.window;
     release_win_data(data);
 
-    { FILE *f = fopen("/tmp/macdrv_debug.log", "a"); if(f){ fprintf(f, "macdrv_GetImage wid=%u\n", (unsigned)wid); fclose(f); } }
     if (!wid) goto fallback;
 
     req_w = src->visrect.right  - src->visrect.left;

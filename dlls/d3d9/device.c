@@ -102,6 +102,44 @@ void swingby_diag(const char *fmt, ...)
     fclose(f);
 }
 
+/* Read Z:\tmp\melammu_snap.bgra into a locked destination surface, honouring
+ * the IPC contract every writer follows (launcher SCK + the capture paths in
+ * this file / surface.c): a 12-byte header of little-endian u32 {width,
+ * height, stride}, then `height` rows of pixel data at `stride` byte offsets
+ * (all current writers emit stride == width*4, i.e. packed BGRA).  Readers
+ * that skip the header shift the image by 3 pixels and corrupt the tail rows.
+ * Returns TRUE if pixels were copied into the lock. */
+BOOL swingby_inject_snap_file(const D3DLOCKED_RECT *lr, UINT dst_w, UINT dst_h)
+{
+    FILE *snap_f = fopen("Z:\\tmp\\melammu_snap.bgra", "rb");
+    uint32_t fw = 0, fh = 0, fs = 0;
+    UINT copy_w, copy_h, y;
+    BOOL ok = FALSE;
+
+    if (!snap_f)
+        return FALSE;
+    if (fread(&fw, 4, 1, snap_f) == 1 && fread(&fh, 4, 1, snap_f) == 1
+            && fread(&fs, 4, 1, snap_f) == 1
+            && fw && fh && fw <= 16384 && fh <= 16384 && fs >= fw * 4)
+    {
+        copy_w = fw < dst_w ? fw : dst_w;
+        copy_h = fh < dst_h ? fh : dst_h;
+        ok = TRUE;
+        for (y = 0; y < copy_h; y++)
+        {
+            BYTE *dst_row = (BYTE *)lr->pBits + (SIZE_T)y * lr->Pitch;
+            if (fseek(snap_f, 12 + (long)y * (long)fs, SEEK_SET)
+                    || fread(dst_row, 1, (size_t)copy_w * 4, snap_f) < (size_t)copy_w * 4)
+            {
+                ok = FALSE;
+                break;
+            }
+        }
+    }
+    fclose(snap_f);
+    return ok;
+}
+
 const struct wined3d_parent_ops d3d9_null_wined3d_parent_ops =
 {
     d3d9_null_wined3d_object_destroyed,
@@ -2088,18 +2126,10 @@ static HRESULT WINAPI d3d9_device_GetFrontBufferData(IDirect3DDevice9Ex *iface,
                     dst_impl->sub_resource_idx, &desc);
             wined3d_mutex_unlock();
 
-            FILE *snap_f = fopen("Z:\\tmp\\melammu_snap.bgra", "rb");
-            if (snap_f)
+            if (swingby_inject_snap_file(&lr, desc.width, desc.height))
             {
-                UINT row_bytes = desc.width * 4;
-                for (UINT y = 0; y < desc.height; y++)
-                {
-                    BYTE *dst_row = (BYTE *)lr.pBits + (LONG)y * lr.Pitch;
-                    if (fread(dst_row, 1, row_bytes, snap_f) < row_bytes) break;
-                }
-                fclose(snap_f);
-                { FILE *lg = fopen("Z:\\tmp\\swingby_stretch.txt","a");
-                  if (lg) { fprintf(lg,"GetFrontBuf intercepted %ux%u\n",desc.width,desc.height); fclose(lg); } }
+                FILE *lg = fopen("Z:\\tmp\\swingby_stretch.txt","a");
+                if (lg) { fprintf(lg,"GetFrontBuf intercepted %ux%u\n",desc.width,desc.height); fclose(lg); }
             }
             IDirect3DSurface9_UnlockRect(dst_surface);
         }
@@ -2394,7 +2424,9 @@ static void swingby_capture_rt_to_snap(IDirect3DDevice9Ex *iface,
         {
             FILE *f = fopen(snap_out, "wb");
             if (f) {
-                uint32_t w = sd.Width, h = sd.Height, s = (uint32_t)lr.Pitch;
+                /* Header stride must describe the file layout (rows below are
+                 * written packed, Width*4), not the source lock pitch. */
+                uint32_t w = sd.Width, h = sd.Height, s = sd.Width * 4;
                 fwrite(&w, 4, 1, f); fwrite(&h, 4, 1, f); fwrite(&s, 4, 1, f);
                 for (row = 0; row < sd.Height; row++)
                     fwrite((char*)lr.pBits + (size_t)row * lr.Pitch, sd.Width * 4, 1, f);
@@ -2507,7 +2539,8 @@ static void swingby_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_d
             f = fopen(snap_out, "wb");
             if (f)
             {
-                uint32_t w = desc.Width, h = desc.Height, s = (uint32_t)lr.Pitch;
+                /* Header stride == packed row bytes (matches the rows written below). */
+                uint32_t w = desc.Width, h = desc.Height, s = desc.Width * 4;
                 fwrite(&w, 4, 1, f);
                 fwrite(&h, 4, 1, f);
                 fwrite(&s, 4, 1, f);

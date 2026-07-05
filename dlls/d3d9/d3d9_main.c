@@ -35,10 +35,6 @@ void WINAPI DebugSetMute(void) {
 IDirect3D9 * WINAPI DECLSPEC_HOTPATCH Direct3DCreate9(UINT sdk_version)
 {
     struct d3d9 *object;
-    { FILE *f = fopen("C:\\swingby_d3d9_loaded.txt", "a");
-      if (f) { fprintf(f, "Direct3DCreate9 sdk=%u\n", sdk_version); fclose(f); }
-      else { FILE *f2 = fopen("Z:\\tmp\\swingby_d3d9_loaded.txt", "a");
-             if (f2) { fprintf(f2, "Direct3DCreate9 via Z: sdk=%u\n", sdk_version); fclose(f2); } } }
 
     TRACE("sdk_version %#x.\n", sdk_version);
 
@@ -60,8 +56,6 @@ IDirect3D9 * WINAPI DECLSPEC_HOTPATCH Direct3DCreate9(UINT sdk_version)
 HRESULT WINAPI DECLSPEC_HOTPATCH Direct3DCreate9Ex(UINT sdk_version, IDirect3D9Ex **d3d9ex)
 {
     struct d3d9 *object;
-    { FILE *f = fopen("C:\\swingby_d3d9_loaded.txt", "a");
-      if (f) { fprintf(f, "Direct3DCreate9Ex sdk=%u\n", sdk_version); fclose(f); } }
 
     TRACE("sdk_version %#x, d3d9ex %p.\n", sdk_version, d3d9ex);
 

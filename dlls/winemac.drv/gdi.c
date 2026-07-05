@@ -193,7 +193,6 @@ static BOOL macdrv_CreateCompatibleDC(PHYSDEV orig, PHYSDEV *pdev)
 
     TRACE("orig %p orig->hdc %p pdev %p pdev->hdc %p\n", orig, (orig ? orig->hdc : NULL), pdev,
           ((pdev && *pdev) ? (*pdev)->hdc : NULL));
-    { FILE *f = fopen("/tmp/macdrv_debug.log", "a"); if(f){ fprintf(f, "CreateCompatibleDC called\n"); fclose(f); } }
 
     if (!physDev) return FALSE;
 
@@ -264,7 +263,6 @@ static const struct user_driver_funcs macdrv_funcs =
     .dc_funcs.pGetDeviceCaps = macdrv_GetDeviceCaps,
     .dc_funcs.pGetDeviceGammaRamp = macdrv_GetDeviceGammaRamp,
     .dc_funcs.pGetImage = macdrv_GetImage,
-    .dc_funcs.pPutImage = macdrv_PutImage,
     .dc_funcs.pSetDeviceGammaRamp = macdrv_SetDeviceGammaRamp,
     .dc_funcs.priority = GDI_PRIORITY_GRAPHICS_DRV,
 
