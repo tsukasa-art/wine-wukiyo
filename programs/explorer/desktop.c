@@ -1193,6 +1193,52 @@ static void set_shell_window( HWND hwnd )
     SetShellWindow( hwnd );
 }
 
+/* --- swingby (melammu): Progman shell window for CIRCUS installers ---------
+ * CIRCUS setup.exe calls FindWindow("Progman", NULL) as a shell-presence gate
+ * and aborts ("シェルの確認に失敗しました") when it returns NULL. Wine creates no
+ * window of class "Progman" (it only marks the desktop window as the shell
+ * window via SetShellWindow, which FindWindow's class lookup does not consult).
+ * Under MELAMMU_PROGMAN_SHELL=1 — set by the launcher only for CIRCUS disc
+ * installers, so no other launch path is affected — create a hidden window of
+ * class "Progman" so the gate passes, and tear the desktop down once the
+ * launched child exits (explorer otherwise idles in its message loop forever
+ * and hangs the launcher's wait on this process). */
+static HANDLE melammu_child_proc;
+static HWND melammu_desktop_hwnd;
+
+static BOOL melammu_progman_shell(void)
+{
+    WCHAR buf[8];
+    return GetEnvironmentVariableW( L"MELAMMU_PROGMAN_SHELL", buf, ARRAY_SIZE(buf) ) && buf[0] == '1';
+}
+
+static void melammu_create_progman_window(void)
+{
+    HINSTANCE hinst = GetModuleHandleW( NULL );
+    WNDCLASSW cls = { 0 };
+    HWND progman;
+
+    cls.lpfnWndProc   = DefWindowProcW;
+    cls.hInstance     = hinst;
+    cls.lpszClassName = L"Progman";
+    RegisterClassW( &cls );  /* one desktop per explorer process; ignore ALREADY_EXISTS */
+
+    /* hidden top-level window (real Program Manager is hidden too); FindWindow
+     * enumerates hidden windows, so visibility is not required. */
+    progman = CreateWindowExW( 0, L"Progman", L"Program Manager", WS_POPUP,
+                               0, 0, 0, 0, HWND_DESKTOP, 0, hinst, NULL );
+    if (progman) SetShellWindow( progman );  /* faithful; not required by FindWindow */
+    else ERR( "melammu: failed to create Progman window, err %lu\n", GetLastError() );
+}
+
+static DWORD WINAPI melammu_child_wait_thread( void *arg )
+{
+    WaitForSingleObject( melammu_child_proc, INFINITE );
+    CloseHandle( melammu_child_proc );
+    PostMessageW( melammu_desktop_hwnd, WM_CLOSE, 0, 0 );  /* -> PostQuitMessage, loop exits */
+    return 0;
+}
+
 /* main desktop management function */
 void manage_desktop( WCHAR *arg )
 {
@@ -1300,6 +1346,8 @@ void manage_desktop( WCHAR *arg )
         }
     }
 
+    if (melammu_progman_shell()) melammu_create_progman_window();
+
     /* if we have a command line, execute it */
     if (cmdline)
     {
@@ -1312,7 +1360,18 @@ void manage_desktop( WCHAR *arg )
         if (CreateProcessW( NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi ))
         {
             CloseHandle( pi.hThread );
-            CloseHandle( pi.hProcess );
+            if (hwnd && melammu_progman_shell())
+            {
+                /* melammu: quit the desktop when the installer child exits, so
+                 * the launcher's wait on this explorer process returns. */
+                HANDLE t;
+                melammu_child_proc = pi.hProcess;
+                melammu_desktop_hwnd = hwnd;
+                if ((t = CreateThread( NULL, 0, melammu_child_wait_thread, NULL, 0, NULL )))
+                    CloseHandle( t );
+                else CloseHandle( pi.hProcess );
+            }
+            else CloseHandle( pi.hProcess );
         }
     }
 
