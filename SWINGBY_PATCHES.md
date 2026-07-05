@@ -5,7 +5,7 @@ Last updated: 2026-07-05
 This repository is the canonical Wine fork for Melammu. The git base is the
 **vanilla WineHQ Wine 10.0 release** (`b0738596` "Release 10.0.", Alexandre
 Julliard); all macOS/Rosetta work is carried by this fork's own patches
-(54 commits / 93 files changed over the base, `b0738596..HEAD`, 2026-07-05).
+(56 commits / 93 files changed over the base, `b0738596..HEAD`, Verified at: 2026-07-05 / `git rev-list --count b0738596..HEAD` + `git diff --shortstat b0738596..HEAD`).
 Sikarugir (formerly Kegworks) is historical lineage
 and credit only — measured source delta over WineHQ 10.0 in this repo is zero
 (no Sikarugir commits are carried here). WineHQ is the upstream to rebase onto.
@@ -36,7 +36,7 @@ third-party wrappers.
 - **② upstream backport / 借用** — 10.0 以降の本家 fix の cherry-pick、または第三者 patch の rebase。汎用 Wine 改善の性格。
 - **③ 自前発明** — swingby/melammu マーカー付き、または macOS/Rosetta/CMVS/Melammu 固有の独自実装。**「自分が当てた内容」はこの段を見れば一望できる**。
 
-**全54コミットが単一 author（fork owner）**＝author では段を判別できない。分類は commit message 語彙（Backport/Original-author/底本）＋マーカー導入有無＋パッチ内容に依拠（✅ git 由来 / 🟡 境界はコード実読要）。件数: **② 11 / ③ 33 / D(doc・chore・merge) 10**。
+**全56コミットが単一 author（fork owner）**＝author では段を判別できない。分類は commit message 語彙（Backport/Original-author/底本）＋マーカー導入有無＋パッチ内容に依拠（✅ git 由来 / 🟡 境界はコード実読要）。件数は再生成コマンドで確認し、2026-07-05 時点は **② 11 / ③ 33 / D(doc・chore・merge) 12**。
 
 ## ③ 自前発明（＝自分が当てた内容の一望）
 
@@ -44,7 +44,7 @@ third-party wrappers.
 
 | # | commit(s) / date | file:function | 症状 / 目的 | engine/game | 根因ポインタ | md5(台帳#) | class |
 |---|---|---|---|---|---|---|---|
-| 1 | `d053267`(05-26)〜`15b45c6`(06-14, ~20 commits) | `dlls/d3d9/surface.c` / `device.c` / `swapchain.c` / `d3d9_main.c` ＋ `dlls/wined3d/swapchain.c`（＋vendored `stb_image_write.h`） | CMVS セーブ画面サムネが黒。back-buffer READONLY lock で last-presented frame を serve、UnlockRect counter で 192x108 検出→injection | CMVS | `research/state/thumbnail.md`、`journeys/2026-06-28-hamidashi-thumbnail-gl-readback-black-rootcause.md` | 台帳外（bundled wine builtin d3d9） | Engine Gated `MELAMMU_CMVS_THUMBS` 🟡潜在的に脆い（正解は launcher SCK single-writer＝thumbnail.md 参照。per-game d3d9 経路は反応的に剥がさない） |
+| 1 | `d053267`(05-26)〜`15b45c6`(06-14, ~20 commits) | `dlls/d3d9/surface.c` / `device.c` / `swapchain.c` / `d3d9_main.c` ＋ `dlls/wined3d/swapchain.c`（＋vendored `stb_image_write.h`） | CMVS セーブ画面サムネが黒。back-buffer READONLY lock で last-presented frame を serve、UnlockRect counter で 192x108 検出→injection。`surface.c:swingby_patch_dat_file_impl` には CMVS `.dat` 直接書換え能力も残る（gate 内・破壊的能力なので反応的に剥がさず ledger 対象） | CMVS | `research/state/thumbnail.md`、`journeys/2026-06-28-hamidashi-thumbnail-gl-readback-black-rootcause.md` | 台帳外（bundled wine builtin d3d9） | Engine Gated `MELAMMU_CMVS_THUMBS` 🟡潜在的に脆い（正解は launcher SCK single-writer＝thumbnail.md 参照。per-game d3d9 経路は反応的に剥がさない） |
 | 2 | `dad6d47`(05-13) | `dlls/winemac.drv/image.c: macdrv_GetImage` | GDI BitBlt が Metal 描画窓で黒を返す→CGWindowList で窓内容を捕捉 | winemac 全般 | `research/state/thumbnail.md` | 台帳外（bundled winemac） | Core Required |
 | 3 | `0491875`(06-13) | `dlls/wow64cpu/cpu.c` | 32bit ゲームが Rosetta で c0000005。far-call を ljmp→lretq に thunk | 全32bit game | `journeys/2026-06-13-wine-prot-exec-map-file-into-view-fix.md`（関連） | 台帳外（bundled wow64cpu） | Core Required ✅ |
 | 4 | `b585585`(06-13) | `dlls/ntdll/loader.c` | delay-load IAT を patch 前に PAGE_READWRITE 化（mingw binutils≥2.43 ld bug 32675 回避） | macOS toolchain | — | 台帳外（bundled ntdll） | Core Required ✅ |
@@ -54,7 +54,8 @@ third-party wrappers.
 | 8 | `0aba0f6`(06-29) | `dlls/dsound/mixer.c: swingby_clamp_float_mix` | in-game SE/BGM の float mix クリップノイズを [-1,1] に saturate | title gated（Hamidashi） | `research/state/audio.md` | #8（Hamidashi dsound） | Engine/Title Gated |
 | 9 | `bee6762`(06-29) | `dlls/dsound/primary.c` | app 要求 primary rate が device より高い時にデバイス再オープン（SRC を CoreAudio へ offload） | title gated（Hamidashi） | `research/state/audio.md` | #8 | Engine/Title Gated |
 | 10 | `5aed1fc`(07-04) | `dlls/imagehlp/integrity.c: ImageGetDigestStream` | SoftDenchi `UCOpgDlg.dll` 自己署名検証を通す per-section PE digest（c0000142 解消） | SoftDenchi DRM | メモリ [[softdenchi-blocked-by-wine-imagehlp-authenticode-mismatch]] | #16, #17 | 旧 Experimental→現 shared 🟡要確認（汎用 Wine correctness としても筋が通る） |
-| 11 | `8d4919b`(06-30) | `dlls/quartz/filtergraph.c`（＋ddraw retarget） | ddraw/VMR-7 を DXVK/Metal 上に。`MELAMMU_LOGO_*` env-gated logo route | Furukiss/GIGA・Hamidashi logo | `journeys/2026-06-24-furukiss-s-giga-op-movie-black-journey.md`、`research/state/movie.md` | #6a,#6b,#11,#13-15 | Title Gated |
+| 11a | `8d4919b`(06-30, master) | `dlls/ddraw/surface.c` + `dlls/winemac.drv/*` | ddraw/VMR-7 front-buffer movie を DXVK/Metal 上に表示（overlay un-hide + surface early-ready）。共有 ddraw/winemac 側の movie 白 fix | Furukiss/GIGA・Hamidashi movie | `research/state/movie.md`, `journeys/2026-06-30-hamidashi-movie-white-dxvk-metal-wined3d-overlay-journey.md` | #3,#4,#6a,#6b,#13-15 | Core Required / title overlay source |
+| 11b | `1ae2460`(topic: `origin/quartz-dsound-startup-avsync` / `verify/hamidashi-quartz-logo-avsync`) | `dlls/quartz/filtergraph.c` / `dsoundrender.c` | Hamidashi startup logo route（`MELAMMU_LOGO_*` env-gated Null Renderer / 200ms delay skip）＋ movie pre-roll `cur < 0` 連続扱い。shared master ではなく title-local `quartz.dll` artifact の source | Hamidashi logo | `research/state/movie.md`, `Melammu/docs/reproducibility-ledger.md` #11 | #11 | Title Gated / topic branch source |
 
 ## ② upstream backport / 借用
 
@@ -69,7 +70,7 @@ third-party wrappers.
 | B5 | `3b4d01e`(06-24) | `dlls/ddraw/surface.c` | 空 clip list 時の unclipped windowed primary blt（Furukiss/GIGA VMR7 OP 黒対策） | `journeys/2026-06-24-furukiss-s-giga-op-movie-black-journey.md` | #6a, #6b | ② 🟡要確認 |
 | B6 | `cb07279`(06-23) | `dlls/dxva2/main.c` | video processor render target を実 RT で作成（macOS GL FBO 起因） | — | — | ② 🟡要確認 |
 
-## D — doc / chore / merge（コード非改変・10件）
+## D — doc / chore / merge（コード非改変・12件）
 
 索引の対象外（README/PATCHES 編集・`wukiyo→swingby` リネーム `bf97c45`・gitignore・merge `e4cea6c`）。機能不変。必要時は `git log --grep` で辿る。
 
@@ -146,8 +147,8 @@ SoftDenchi-related work after that point is experimental/post-v1 and must not
 be included in the canonical v1 runtime without a separate gate:
 
 ```text
-57cd6848acc... wtsapi32 WTS session nudge
-643e95ec332... crypt32 CryptBinaryToStringA(CRYPT_STRING_HEX)
+930fe5b75a5... wtsapi32 WTS session nudge (`verify/softdenchi-wts-session`)
+635d5380509... crypt32 CryptBinaryToStringA(CRYPT_STRING_HEX) (`verify/softdenchi-wts-session`)
 ```
 
 ## Patch Classes
