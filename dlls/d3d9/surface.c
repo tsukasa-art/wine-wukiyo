@@ -241,7 +241,13 @@ static HRESULT WINAPI d3d9_surface_GetDesc(IDirect3DSurface9 *iface, D3DSURFACE_
  * StretchRect events we can determine which slot is being rendered and inject the
  * screenshot that was taken at that slot's save time.
  *
- * Communication files (all written by Melammu on macOS side):
+ * Communication files. melammu_snap.bgra has multiple writers: Melammu (macOS
+ * launcher, SCK-based — see GameCaptureService.swift / LibraryViewModel), plus
+ * three wine-side writers (device.c's blt-based capture and last-good-frame
+ * paths, and swingby_write_last_good_snap_file below) that raced against the
+ * launcher writer and produced black thumbnails; see research/state/thumbnail.md
+ * for the resolved design (launcher SCK is now the sole real-pixel source).
+ * The per-slot files below are launcher-written only:
  *   /tmp/melammu_snap.bgra          – fallback: most recent screenshot (persistent)
  *   /tmp/melammu_snap_NNN.bgra      – per-slot snap for slot NNN (written at save time)
  *   /tmp/melammu_page_base.txt      – first slot number of the current save-screen page
