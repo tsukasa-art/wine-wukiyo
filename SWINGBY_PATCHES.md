@@ -5,7 +5,7 @@ Last updated: 2026-07-05
 This repository is the canonical Wine fork for Melammu. The git base is the
 **vanilla WineHQ Wine 10.0 release** (`b0738596` "Release 10.0.", Alexandre
 Julliard); all macOS/Rosetta work is carried by this fork's own patches
-(56 commits / 93 files changed over the base, `b0738596..HEAD`, Verified at: 2026-07-05 / `git rev-list --count b0738596..HEAD` + `git diff --shortstat b0738596..HEAD`).
+(60 commits / 93 files changed over the base, Verified at: 2026-07-05 / `git rev-list --count b0738596..b6aff9ef219` + `git diff --shortstat b0738596..b6aff9ef219` — 端点を SHA に固定して数える。HEAD 基準だと台帳 commit 自身で off-by-one が再発する).
 Sikarugir (formerly Kegworks) is historical lineage
 and credit only — measured source delta over WineHQ 10.0 in this repo is zero
 (no Sikarugir commits are carried here). WineHQ is the upstream to rebase onto.
@@ -36,7 +36,7 @@ third-party wrappers.
 - **② upstream backport / 借用** — 10.0 以降の本家 fix の cherry-pick、または第三者 patch の rebase。汎用 Wine 改善の性格。
 - **③ 自前発明** — swingby/melammu マーカー付き、または macOS/Rosetta/CMVS/Melammu 固有の独自実装。**「自分が当てた内容」はこの段を見れば一望できる**。
 
-**全56コミットが単一 author（fork owner）**＝author では段を判別できない。分類は commit message 語彙（Backport/Original-author/底本）＋マーカー導入有無＋パッチ内容に依拠（✅ git 由来 / 🟡 境界はコード実読要）。件数は再生成コマンドで確認し、2026-07-05 時点は **② 11 / ③ 33 / D(doc・chore・merge) 12**。
+**全56コミットが単一 author（fork owner）**＝author では段を判別できない。分類は commit message 語彙（Backport/Original-author/底本）＋マーカー導入有無＋パッチ内容に依拠（✅ git 由来 / 🟡 境界はコード実読要）。件数は再生成コマンドで確認し、`b0738596..b6aff9ef219`（2026-07-05）時点は **② 11 / ③ 34 / D(doc・chore・build・merge) 15**。
 
 ## ③ 自前発明（＝自分が当てた内容の一望）
 
@@ -44,8 +44,8 @@ third-party wrappers.
 
 | # | commit(s) / date | file:function | 症状 / 目的 | engine/game | 根因ポインタ | md5(台帳#) | class |
 |---|---|---|---|---|---|---|---|
-| 1 | `d053267`(05-26)〜`15b45c6`(06-14, ~20 commits) | `dlls/d3d9/surface.c` / `device.c` / `swapchain.c` / `d3d9_main.c` ＋ `dlls/wined3d/swapchain.c`（＋vendored `stb_image_write.h`） | CMVS セーブ画面サムネが黒。back-buffer READONLY lock で last-presented frame を serve、UnlockRect counter で 192x108 検出→injection。`surface.c:swingby_patch_dat_file_impl` には CMVS `.dat` 直接書換え能力も残る（gate 内・破壊的能力なので反応的に剥がさず ledger 対象） | CMVS | `research/state/thumbnail.md`、`journeys/2026-06-28-hamidashi-thumbnail-gl-readback-black-rootcause.md` | 台帳外（bundled wine builtin d3d9） | Engine Gated `MELAMMU_CMVS_THUMBS` 🟡潜在的に脆い（正解は launcher SCK single-writer＝thumbnail.md 参照。per-game d3d9 経路は反応的に剥がさない） |
-| 2 | `dad6d47`(05-13) | `dlls/winemac.drv/image.c: macdrv_GetImage` | GDI BitBlt が Metal 描画窓で黒を返す→CGWindowList で窓内容を捕捉 | winemac 全般 | `research/state/thumbnail.md` | 台帳外（bundled winemac） | Core Required |
+| 1 | `d053267`(05-26)〜`15b45c6`(06-14, ~20 commits)・堅牢化 `b6aff9ef219`(07-05) | `dlls/d3d9/surface.c` / `device.c` / `swapchain.c` / `d3d9_main.c` ＋ `dlls/wined3d/swapchain.c`（＋vendored `stb_image_write.h`） | CMVS セーブ画面サムネが黒。back-buffer READONLY lock で last-presented frame を serve、UnlockRect counter で 192x108 検出→injection。`surface.c:swingby_patch_dat_file_impl` には CMVS `.dat` 直接書換え能力も残る（gate 内・破壊的能力なので反応的に剥がさず ledger 対象）。07-05 堅牢化（FULL_AUDIT W-H2/W-H3）: swapchain.c 版 snap 注入を device.c 版と同じ gate 下に置き、両 reader を 12byte ヘッダ準拠に（`swingby_inject_snap_file()` 共通化）、writer のヘッダ stride を実レイアウト(w*4 packed)に訂正、`d3d9_main.c` の無条件 `swingby_d3d9_loaded.txt` マーカーを除去 | CMVS | `research/state/thumbnail.md`、`journeys/2026-06-28-hamidashi-thumbnail-gl-readback-black-rootcause.md` | 台帳外（bundled wine builtin d3d9） | Engine Gated `MELAMMU_CMVS_THUMBS`（`b6aff9ef219` で gate 主張がコード実態と一致）🟡潜在的に脆い（正解は launcher SCK single-writer＝thumbnail.md 参照。per-game d3d9 経路は反応的に剥がさない） |
+| 2 | `dad6d47`(05-13)・掃除 `b6aff9ef219`(07-05) | `dlls/winemac.drv/image.c: macdrv_GetImage` | GDI BitBlt が Metal 描画窓で黒を返す→CGWindowList で窓内容を捕捉。07-05 掃除（FULL_AUDIT W-H3）: ungated `/tmp/macdrv_debug.log` append（GetImage×3・gdi.c CreateCompatibleDC）を除去、ログ専用 `macdrv_PutImage` hook を撤去（upstream dispatch 復帰・DIB 描画エンジンでの無限成長ログ＝jetsam リスク解消） | winemac 全般 | `research/state/thumbnail.md` | 台帳外（bundled winemac） | Core Required |
 | 3 | `0491875`(06-13) | `dlls/wow64cpu/cpu.c` | 32bit ゲームが Rosetta で c0000005。far-call を ljmp→lretq に thunk | 全32bit game | `journeys/2026-06-13-wine-prot-exec-map-file-into-view-fix.md`（関連） | 台帳外（bundled wow64cpu） | Core Required ✅ |
 | 4 | `b585585`(06-13) | `dlls/ntdll/loader.c` | delay-load IAT を patch 前に PAGE_READWRITE 化（mingw binutils≥2.43 ld bug 32675 回避） | macOS toolchain | — | 台帳外（bundled ntdll） | Core Required ✅ |
 | 5 | `e9a93b3`(06-12) | `dlls/ntdll/unix/virtual.c` | macOS AMFI が PROT_EXEC mmap を拒否→PROT なし mmap→mprotect で exec 付与 | 全 game | `journeys/2026-06-13-wine-prot-exec-map-file-into-view-fix.md` | 台帳外（bundled ntdll） | Core Required 🟡要確認（Sikarugir out-of-tree から concept port＝②寄りの境界） |
