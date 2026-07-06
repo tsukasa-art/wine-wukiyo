@@ -299,6 +299,79 @@ static BOOL BinaryToHexRawA(const BYTE *bin, DWORD nbin, DWORD flags, char *str,
     return TRUE;
 }
 
+static BOOL binary_to_hexA(const BYTE *bin, DWORD nbin, DWORD flags, char *str, DWORD *nstr)
+{
+    static const char hex[] = "0123456789abcdef";
+    DWORD needed, i;
+
+    needed = nbin * 3; /* spaces + terminating \0 */
+
+    if (flags & CRYPT_STRING_NOCR)
+    {
+        needed += (nbin + 7) / 16; /* space every 16 characters */
+        needed += 1; /* terminating \n */
+    }
+    else if (!(flags & CRYPT_STRING_NOCRLF))
+    {
+        needed += (nbin + 7) / 16; /* space every 16 characters */
+        needed += nbin / 16 + 1; /* LF every 16 characters + terminating \r */
+
+        if (nbin % 16)
+            needed += 1; /* terminating \n */
+    }
+
+    if (!str)
+    {
+        *nstr = needed;
+        return TRUE;
+    }
+
+    if (needed > *nstr)
+    {
+        SetLastError(ERROR_MORE_DATA);
+        return FALSE;
+    }
+
+    for (i = 0; i < nbin; i++)
+    {
+        *str++ = hex[(bin[i] >> 4) & 0xf];
+        *str++ = hex[bin[i] & 0xf];
+
+        if (i >= nbin - 1) break;
+
+        if (i && !(flags & CRYPT_STRING_NOCRLF))
+        {
+            if (!((i + 1) % 16))
+            {
+                if (flags & CRYPT_STRING_NOCR)
+                    *str++ = '\n';
+                else
+                {
+                    *str++ = '\r';
+                    *str++ = '\n';
+                }
+                continue;
+            }
+            else if (!((i + 1) % 8))
+                *str++ = ' ';
+        }
+
+        *str++ = ' ';
+    }
+
+    if (flags & CRYPT_STRING_NOCR)
+        *str++ = '\n';
+    else if (!(flags & CRYPT_STRING_NOCRLF))
+    {
+        *str++ = '\r';
+        *str++ = '\n';
+    }
+
+    *str = 0;
+    *nstr = needed - 1;
+    return TRUE;
+}
+
 BOOL WINAPI CryptBinaryToStringA(const BYTE *pbBinary,
  DWORD cbBinary, DWORD dwFlags, LPSTR pszString, DWORD *pcchString)
 {
@@ -333,6 +406,8 @@ BOOL WINAPI CryptBinaryToStringA(const BYTE *pbBinary,
         encoder = BinaryToHexRawA;
         break;
     case CRYPT_STRING_HEX:
+        encoder = binary_to_hexA;
+        break;
     case CRYPT_STRING_HEXASCII:
     case CRYPT_STRING_HEXADDR:
     case CRYPT_STRING_HEXASCIIADDR:
