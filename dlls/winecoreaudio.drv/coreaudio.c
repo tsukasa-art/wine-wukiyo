@@ -298,6 +298,15 @@ static NTSTATUS unix_get_endpoint_ids(void *args)
     for(i = 0; i < num_devices; i++){
         if(!device_has_channels(devices[i], params->flow)) continue;
 
+        /* Orrery: expose ONLY the current system-default endpoint. Device
+         * selection is macOS's job (Sound settings); Wine just follows the
+         * default. Enumerating every device here makes DirectShow RenderFile
+         * probe each one's format caps via CoreAudio (expensive on the HAL,
+         * multiplied by virtual/aggregate devices like BlackHole), for a
+         * device the game will never use. If the default couldn't be resolved
+         * (default_id == -1) fall back to stock all-device enumeration. */
+        if(default_id != (AudioDeviceID)-1 && devices[i] != default_id) continue;
+
         addr.mSelector = kAudioObjectPropertyName;
         size = sizeof(CFStringRef);
         sc = AudioObjectGetPropertyData(devices[i], &addr, 0, NULL, &size, &info[params->num].name);
