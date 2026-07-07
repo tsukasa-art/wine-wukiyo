@@ -1821,8 +1821,27 @@ static HRESULT WINAPI stream_select_Info(IAMStreamSelect *iface, LONG index,
 
 static HRESULT WINAPI stream_select_Enable(IAMStreamSelect *iface, LONG index, DWORD flags)
 {
-    FIXME("iface %p, index %ld, flags %#lx, stub!\n", iface, index, flags);
-    return E_NOTIMPL;
+    struct parser *filter = impl_from_IAMStreamSelect(iface);
+    HRESULT hr = S_OK;
+
+    /* Accept the selection without actually switching streams. All demuxed
+     * streams are already exposed and active, so re-enabling the stream that
+     * is currently playing (the common case: KiriKiri's krmovie re-selects
+     * its audio stream on every savedata restore) is a no-op; returning
+     * E_NOTIMPL here makes such games abort with 0x80004001. Files with
+     * multiple alternative audio streams would need real stream switching. */
+    FIXME("filter %p, index %ld, flags %#lx, semi-stub: accepting selection without switching streams.\n",
+            filter, index, flags);
+
+    EnterCriticalSection(&filter->filter.filter_cs);
+
+    if (!filter->sink.pin.peer)
+        hr = VFW_E_NOT_CONNECTED;
+    else if (index < 0 || index >= filter->source_count)
+        hr = E_INVALIDARG;
+
+    LeaveCriticalSection(&filter->filter.filter_cs);
+    return hr;
 }
 
 static const IAMStreamSelectVtbl stream_select_vtbl =
