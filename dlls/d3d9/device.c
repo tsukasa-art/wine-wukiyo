@@ -2392,7 +2392,10 @@ static HRESULT WINAPI d3d9_device_CreateOffscreenPlainSurface(IDirect3DDevice9Ex
     }
 }
 
-/* Capture any GPU surface → melammu_snap.bgra via wined3d_device_context_blt.
+/* LEGACY (CMVS-only, gated by MELAMMU_CMVS_THUMBS, default-off). Canonical capture =
+ * launcher SCK single-writer (research/state/thumbnail.md). Do not extend per-game.
+ *
+ * Capture any GPU surface → melammu_snap.bgra via wined3d_device_context_blt.
  * Call WITHOUT holding the wined3d mutex (same calling convention as
  * swingby_capture_frontbuffer).  Used for on-demand thumbnail capture from the
  * exact render target CMVS reads, so we get fresh, HUD-free content. */
@@ -2455,7 +2458,10 @@ static void swingby_capture_rt_to_snap(IDirect3DDevice9Ex *iface,
     IDirect3DSurface9_Release(sys);
 }
 
-/* Capture the back buffer to an in-process last-good frame every Present.
+/* LEGACY (CMVS-only, gated by MELAMMU_CMVS_THUMBS, default-off). Canonical capture =
+ * launcher SCK single-writer (research/state/thumbnail.md). Do not extend per-game.
+ *
+ * Capture the back buffer to an in-process last-good frame every Present.
  * The disk snap is still rate-limited; the hot path is for CMVS saves where the
  * scene can change immediately before the save menu reads its thumbnail RT. */
 static void swingby_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_device *device)
