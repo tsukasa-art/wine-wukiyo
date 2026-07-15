@@ -1,6 +1,6 @@
 # Melammu Wine Patch Policy + Ledger (swingby-wine)
 
-Last updated: 2026-07-05
+Last updated: 2026-07-15
 
 This repository is the canonical Wine fork for Melammu. The git base is the
 **vanilla WineHQ Wine 10.0 release** (`b0738596` "Release 10.0.", Alexandre
@@ -70,6 +70,7 @@ third-party wrappers.
 | B4 | `61dc20e`+`29cfa3b`(06-22), `aa872c7`+`6f32d23`(06-23) | `dlls/quartz/{vmr7,vmr9,vmr7_presenter,filtergraph}.c` ＋tests | VMR7/9 image presenter 実装・present rect・graph lock 回避（EOS deadlock）・RGB24 対応 | `journeys/2026-06-23-...evr-white-thumbnail-black-journey.md`、`journeys/2026-06-25-galsfiction-...-evr-black-journey.md` | #9-#11 | ② 🟡要確認（汎用 quartz 実装・test 付） |
 | B5 | `3b4d01e`(06-24) | `dlls/ddraw/surface.c` | 空 clip list 時の unclipped windowed primary blt（Furukiss/GIGA VMR7 OP 黒対策） | `journeys/2026-06-24-furukiss-s-giga-op-movie-black-journey.md` | #6a, #6b | ② 🟡要確認 |
 | B6 | `cb07279`(06-23) | `dlls/dxva2/main.c` | video processor render target を実 RT で作成（macOS GL FBO 起因） | — | — | ② 🟡要確認 |
+| B7 | `8ca998d09e4`(07-15) | `dlls/user32/{user32.spec,win.c}:IsWindowArranged` | DMM GAME PLAYER 5.5.13 / Electron 42.5.0 が delay-load する `IsWindowArranged` を WineHQ `a7d7024479e` から backport。未 export 時は `ERROR_PROC_NOT_FOUND(127)` → Chromium ImmediateCrash。upstream 同様 `FALSE` を返す stub で、隔離 runtime にて login window 生存・Crashpad dump 0 を確認 | `../Melammu/docs/reviews/handoffs/2026-07-15-dmm-5.5.13-iswindowarranged.md` | 台帳追加前（bundle 未配備） | ② ✅（WineHQ 10.8 upstream backport） |
 
 ## D — doc / chore / merge（コード非改変・12件）
 
