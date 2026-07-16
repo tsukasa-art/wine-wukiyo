@@ -1621,12 +1621,13 @@ static HRESULT ddraw_surface_blt_clipped(struct ddraw_surface *dst_surface, cons
         struct ddraw_surface *src_surface, const RECT *src_rect_in, DWORD flags, DWORD fill_colour,
         const struct wined3d_blt_fx *fx, enum wined3d_texture_filter_type filter)
 {
-    RECT src_rect, dst_rect;
+    RECT src_rect, dst_rect, surface_rect;
     float scale_x, scale_y;
     const RECT *clip_rect;
     DWORD clip_list_size;
     RGNDATA *clip_list;
     HRESULT hr = DD_OK;
+    BOOL windowed_primary;
     UINT i;
 
     if (!dst_rect_in)
@@ -1697,16 +1698,31 @@ static HRESULT ddraw_surface_blt_clipped(struct ddraw_surface *dst_surface, cons
     }
 
     clip_rect = (RECT *)clip_list->Buffer;
+    SetRect(&surface_rect, 0, 0, dst_surface->surface_desc.dwWidth, dst_surface->surface_desc.dwHeight);
+    windowed_primary = (dst_surface->surface_desc.ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE)
+            && dst_surface->ddraw->swapchain_window
+            && dst_surface->clipper->window == dst_surface->ddraw->swapchain_window
+            && !(dst_surface->ddraw->cooperative_level & DDSCL_EXCLUSIVE)
+            && IsWindowVisible(dst_surface->clipper->window)
+            && !IsIconic(dst_surface->clipper->window);
     for (i = 0; i < clip_list->rdh.nCount; ++i)
     {
+        RECT dst_rect_clipped = clip_rect[i];
         RECT src_rect_clipped = src_rect;
+
+        if (windowed_primary && (dst_rect_clipped.left < surface_rect.left
+                || dst_rect_clipped.top < surface_rect.top
+                || dst_rect_clipped.right > surface_rect.right
+                || dst_rect_clipped.bottom > surface_rect.bottom)
+                && !IntersectRect(&dst_rect_clipped, &clip_rect[i], &surface_rect))
+            continue;
 
         if (src_surface)
         {
-            src_rect_clipped.left += (LONG)((clip_rect[i].left - dst_rect.left) * scale_x);
-            src_rect_clipped.top += (LONG)((clip_rect[i].top - dst_rect.top) * scale_y);
-            src_rect_clipped.right -= (LONG)((dst_rect.right - clip_rect[i].right) * scale_x);
-            src_rect_clipped.bottom -= (LONG)((dst_rect.bottom - clip_rect[i].bottom) * scale_y);
+            src_rect_clipped.left += (LONG)((dst_rect_clipped.left - dst_rect.left) * scale_x);
+            src_rect_clipped.top += (LONG)((dst_rect_clipped.top - dst_rect.top) * scale_y);
+            src_rect_clipped.right -= (LONG)((dst_rect.right - dst_rect_clipped.right) * scale_x);
+            src_rect_clipped.bottom -= (LONG)((dst_rect.bottom - dst_rect_clipped.bottom) * scale_y);
 
             if (src_surface->surface_desc.ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE)
             {
@@ -1715,13 +1731,13 @@ static HRESULT ddraw_surface_blt_clipped(struct ddraw_surface *dst_surface, cons
             }
         }
 
-        if (FAILED(hr = ddraw_surface_blt(dst_surface, &clip_rect[i],
+        if (FAILED(hr = ddraw_surface_blt(dst_surface, &dst_rect_clipped,
                 src_surface, &src_rect_clipped, flags, fill_colour, fx, filter)))
             break;
 
         if (dst_surface->surface_desc.ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE)
         {
-            if (FAILED(hr = ddraw_surface_update_frontbuffer(dst_surface, &clip_rect[i], FALSE, 0)))
+            if (FAILED(hr = ddraw_surface_update_frontbuffer(dst_surface, &dst_rect_clipped, FALSE, 0)))
                 break;
         }
     }

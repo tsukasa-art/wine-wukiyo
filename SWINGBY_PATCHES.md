@@ -1,6 +1,6 @@
 # Melammu Wine Patch Policy + Ledger (swingby-wine)
 
-Last updated: 2026-07-15
+Last updated: 2026-07-16
 
 This repository is the canonical Wine fork for Melammu. The git base is the
 **vanilla WineHQ Wine 10.0 release** (`b0738596` "Release 10.0.", Alexandre
@@ -57,6 +57,7 @@ third-party wrappers.
 | 11a | `8d4919b`(06-30, master) | `dlls/ddraw/surface.c` + `dlls/winemac.drv/*` | ddraw/VMR-7 front-buffer movie を DXVK/Metal 上に表示（overlay un-hide + surface early-ready）。共有 ddraw/winemac 側の movie 白 fix | Furukiss/GIGA・Hamidashi movie | `research/state/movie.md`, `journeys/2026-06-30-hamidashi-movie-white-dxvk-metal-wined3d-overlay-journey.md` | #3,#4,#6a,#6b,#13-15 | Core Required / title overlay source |
 | 11b | `1ae2460`(topic: `origin/quartz-dsound-startup-avsync` / `verify/hamidashi-quartz-logo-avsync`) | `dlls/quartz/filtergraph.c` / `dsoundrender.c` | Hamidashi startup logo route（`MELAMMU_LOGO_*` env-gated Null Renderer / 200ms delay skip）＋ movie pre-roll `cur < 0` 連続扱い。shared master ではなく title-local `quartz.dll` artifact の source | Hamidashi logo | `research/state/movie.md`, `Melammu/docs/reproducibility-ledger.md` #11 | #11 | Title Gated / topic branch source |
 | 12 | `6c217e5`(07-06, master) | `dlls/winecoreaudio.drv/coreaudio.c: unix_get_endpoint_ids` | 音声エンドポイント列挙を現在の system-default 1個に絞る。DirectShow RenderFile が全 output/input デバイスの format caps を HAL でプローブ（BlackHole/複数出力装置で増幅）するのを削減。デバイス選択は macOS の仕事＝Wine は既定出力に追従のみ。default 解決不可なら stock 全列挙に fallback。furukiss OP 白 -0.37s(11%) | 全 game（shared・DirectSound/mmdevapi 経路） | メモリ [[wine-audio-expose-default-device-only]]、[[furukiss-movie-white-is-audio-device-enum-not-gstreamer]]、`research/state/movie.md` | 台帳外（bundled winecoreaudio.so・md5 `ca05fe51`） | shared（全 game・default-only enum・fallback で stock 挙動）✅実機非回帰(furukiss OP音声＋reallive/ナツユメナギサ・2026-07-06) |
+| 13 | candidate（07-16、source-audit batch） | `dlls/ddraw/surface.c: ddraw_surface_blt_clipped` | VMR7 の non-empty clip rectangle が windowed primary surface bounds を越える時だけ destination を intersect し、original destination/source から一度で source crop。`DDERR_INVALIDRECT` を回避し、in-bounds・他 clipper mode・empty fallback は保持 | Pieces／揺り籠のカナリア、渡り鳥のソムニウム | `../Melammu/docs/reviews/batches/20260716-pieces-vmr7-invalidrect-fix/implementation-01.md` | candidate i386 `f217c4a...` / x86_64 `7c4782de...`（accepted #6a/#6b への昇格前） | High-risk shared candidate。揺り籠 fixed-run＋渡り鳥 PASS、Furukiss は title-local overlay 経路。cs2/artemis は独立監査の残余 risk |
 
 ## ② upstream backport / 借用
 
