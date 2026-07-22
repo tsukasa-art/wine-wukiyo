@@ -38,6 +38,21 @@ sourceをそのまま取り込んだものではありません。詳細な境�
 | **swingby-wine** | Melammuが利用する公開Wine source fork |
 | **[melammu-vn](https://github.com/tsukasa-art/melammu-vn)** | SwiftUI UIと汎用判定を切り出したsource-only公開参照実装。完成ランチャー、runtime同梱版、release配布物ではない |
 
+## 公開ブランチ
+
+正典の統合枝は`master`だけです。それ以外の公開branchは、検証可能な実験履歴または
+復旧用履歴を保存するrefであり、別系統のruntime bundleではありません。
+
+| ブランチ | 目的 | 現在の扱い |
+|---|---|---|
+| `master` | WineHQ Wine 10.0 releaseをbaseとする、Melammu向けの保守対象patch set | **正典。** 保守する変更はここへ統合します。Wine forkの慣例に合わせて`main`ではなく`master`を使用します。 |
+| `quartz-dsound-startup-avsync` | DirectSoundのstartup preroll、WineGStreamerのqueue、build provenance、関連diagnosticsを検証したmedia/audio実験 | **複合実験履歴。** 採用済みの着想、置換済みthumbnail実験、未解決WIPが混在します。branch全体をmerge・bundleせず、必要なcommitを個別に評価します。 |
+| `quartz-vmr9-image-presenter` | movie presentation経路を調査した歴史的milestone | **`master`へ包含済み。** branch名は当初のVMR9仮説を残していますが、検証後の修正経路はVMR7 presenterのrectangle、window retarget、graph lock処理でした。現役の開発枝ではありません。 |
+| `backup/pre-purge-master-fa93c4d-2026-06-15` | rehabilitation前の`master` snapshot | **復旧参照専用。** このbranchでは開発しません。 |
+
+Verified at: 2026-07-22（`git ls-remote --heads origin`と`origin/master`に対する
+ancestry確認）。
+
 ## 現行graphics runtimeの境界
 
 非公開Melammuは、作品・engineごとの検証結果に基づいてrendererを選びます。

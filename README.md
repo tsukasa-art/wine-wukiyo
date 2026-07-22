@@ -68,11 +68,18 @@ Snap file format:
 
 ## Branches
 
-| Branch | Base | Contents |
+Only `master` is the canonical integration branch. The other public refs preserve
+reviewable experiment or recovery history; they are not alternate runtime bundles.
+
+| Branch | Role | Status |
 |---|---|---|
-| `master` | WineHQ Wine 10.0 release | **canonical** — supported Melammu Wine patch set (Wine fork convention; no `main`) |
-| `softdenchi-wts-session` | `master` | experimental/post-v1 (SoftDenchi WTS / crypt32). Not bundled unless promoted |
-| `backup/pre-purge-master-*` | — | historical reference (pre-rehab master snapshot) |
+| `master` | Supported Melammu Wine patch set based on the WineHQ Wine 10.0 release | **Canonical.** Integrate maintained changes here; this Wine fork follows the upstream `master` convention rather than `main`. |
+| `quartz-dsound-startup-avsync` | Experimental media/audio work around DirectSound preroll, WineGStreamer queueing, build provenance, and related diagnostics | **Mixed experiment history.** It contains ideas that were adopted, superseded thumbnail work, and unresolved WIP. Review commits individually; do not merge or bundle the branch wholesale. |
+| `quartz-vmr9-image-presenter` | Historical movie-presentation investigation | **Contained in `master`.** The branch name records the initial VMR9 hypothesis; verification moved the fix path to VMR7 presenter rectangles, window retargeting, and graph-lock handling. Retained as a milestone, not an active development line. |
+| `backup/pre-purge-master-fa93c4d-2026-06-15` | Snapshot of the pre-rehabilitation `master` | **Recovery reference only.** No active development takes place on this branch. |
+
+Verified at: 2026-07-22 (`git ls-remote --heads origin` and ancestry checks against
+`origin/master`).
 
 ## Build (macOS / Rosetta 2)
 
