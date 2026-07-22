@@ -1,8 +1,41 @@
 # swingby-wine
 
-A personal Wine fork targeting macOS (Apple Silicon / Rosetta 2), built for use with the [Melammu](https://github.com/tsukasa-art/melammu-vn) launcher. Part of **Orrery** — a macOS compatibility layer for Windows visual novels. Based on the [WineHQ](https://gitlab.winehq.org/wine/wine) **Wine 10.0 release** (`b0738596`), it carries this fork's own macOS/Rosetta compatibility patches. This repository is the source of truth for Melammu's bundled Wine runtime; WineHQ is the upstream to rebase onto.
+[日本語](README.ja.md)
 
-Inspired by the macOS Wine work of [Sikarugir](https://github.com/Sikarugir-App/Creator) (formerly Kegworks). See [SWINGBY_PATCHES.md](SWINGBY_PATCHES.md) for the responsibility boundary and patch classification.
+**swingby-wine** is the public Wine fork used by **Melammu**, the private
+launcher at the core of [Orrery](https://tsukasa-art.com/projects/orrery/).
+Orrery is a compatibility and library project for running Windows visual
+novels as Mac applications without modifying the games themselves.
+
+The fork is based directly on the [WineHQ](https://gitlab.winehq.org/wine/wine)
+**Wine 10.0 release** (`b0738596`). This repository is the canonical source for
+its Wine-side macOS and Rosetta compatibility patches. Runtime selection,
+packaging, signing, and release policy belong to the private Melammu project;
+the launcher and its release artifacts are not published here.
+
+The fork credits [Sikarugir](https://github.com/Sikarugir-App/Sikarugir) as
+macOS Wine prior art. One executable-memory change is an attributed conceptual
+port and non-verbatim reimplementation, not copied Sikarugir source. The exact
+provenance boundary is recorded in [SWINGBY_PATCHES.md](SWINGBY_PATCHES.md).
+
+## What this fork demonstrates
+
+| Area | Work in this repository |
+|---|---|
+| 32-bit execution on Apple Silicon | Rosetta-aware work in `wow64cpu` and executable-memory handling in `ntdll` |
+| macOS window and presentation behavior | Changes in `winemac.drv`, `win32u`, DirectDraw, and WineD3D |
+| Media and audio compatibility | Selected work in Quartz, WineGStreamer, DXVA2, DirectSound, and CoreAudio paths |
+| Isolated title or engine behavior | Explicit default-off gates such as `MELAMMU_CMVS_THUMBS` |
+| Patch provenance | A ledger separating WineHQ backports, attributed ports, and original fork changes |
+
+Compatibility claims remain limited to the title, version, launch route, and
+runtime that were actually verified. This repository provides Wine source and
+build instructions, not a packaged Melammu release.
+
+The public [melammu-vn](https://github.com/tsukasa-art/melammu-vn) repository is
+a source-only reference implementation extracted from Melammu. It exposes a
+curated SwiftUI library UI and generic engine detection; it is not the complete
+launcher, a runtime bundle, or a public release of Melammu.
 
 ## Runtime dependency
 
@@ -57,39 +90,44 @@ arch -x86_64 make -s -j$(sysctl -n hw.activecpu)
 
 Produces x86_64 binaries that run under Rosetta 2.
 
-## Deploy into Melammu
+## Integration boundary
 
-The built `.so` files replace their counterparts inside `Melammu.app/Contents/Resources/wine-support/`. ABI must match — build from the `master` branch (WineHQ Wine 10.0 base).
+The build produces Wine artifacts, not a ready-to-run Melammu application.
+Integrators must keep PE and Unix-side modules ABI-matched, record source
+revisions and artifact hashes, and apply their own signing and distribution
+policy. Private Melammu scripts, bundle paths, and title-specific deployment
+procedures are intentionally not presented as public instructions.
 
-```bash
-WINE_LIB=~/Applications/Melammu.app/Contents/Resources/wine-support/wine/lib/wine/x86_64-unix
+## Current graphics-runtime model
 
-# winemac patch
-cp build/dlls/winemac.drv/winemac.so "$WINE_LIB/winemac.so"
-codesign --force --sign - "$WINE_LIB/winemac.so"
+Renderer selection is title- and engine-specific in the private launcher:
 
-# d3d9 thumbnail injection
-cp build/dlls/d3d9/d3d9.dll.so "$WINE_LIB/d3d9.dll.so"
-codesign --force --sign - "$WINE_LIB/d3d9.dll.so"
-```
+- Wine's built-in **WineD3D / OpenGL** route remains the baseline for many D3D9
+  and DirectDraw paths.
+- **DXVK -> Vulkan -> MoltenVK -> Metal** is selected only for routes where it
+  has been verified. It is not a blanket replacement for WineD3D.
+- Mixed routes can keep D3D9 or DirectDraw on WineD3D while using DXVK for
+  D3D11. The launcher owns renderer policy; this repository owns the Wine-side
+  patches and default-off gates.
 
-Alternatively, use the `deploy.sh` / `deploy_d3d9.sh` scripts in the Melammu repo which handle paths and re-signing automatically.
-
-**Note on notarization**: Ad-hoc re-signing (`-`) is sufficient for running on your own Mac (with Terminal listed under Privacy & Security → Developer Tools). Distribution requires a Developer ID certificate and full re-notarization of Melammu.app.
-
-## Notes on D3D9
-
-For D3D9 games (KiriKiriZ, etc.), [d9vk](https://github.com/Joshua-Ashton/d9vk) (D3D9→Vulkan→MoltenVK→Metal) is recommended over Wine's built-in wined3d. Melammu bundles d9vk and writes `drive_c/dxvk.conf` with `d3d9.presentInterval = 1` at install time to force vsync — without this, KiriKiriZ engines write `waitvsync=no` to their `.cfu` config on first run, causing flickering on Wine+Metal.
-
-D3DMetal (Apple GPTK) covers D3D11/D3D12/DXGI/DDraw but **not** D3D9; d9vk remains the correct path for D3D9 titles.
+Apple D3DMetal / Game Porting Toolkit components are not part of the current
+runtime described by this repository.
 
 ## Related
 
-- [Melammu](https://github.com/tsukasa-art/melammu-vn) — macOS launcher and HUD that drives the thumbnail injection
-- [Sikarugir](https://github.com/Sikarugir-App/Creator) — macOS Wine work that inspired this project
-- [Zenn: Mac で美少女ゲームを動かす](https://zenn.dev/tsukasa_art/articles/mac-eroge-compat-part1) — series documenting the compatibility work
+- [Orrery](https://tsukasa-art.com/projects/orrery/) — project overview
+- [Orrery Case Notes](https://tsukasa-art.com/projects/orrery/#research-notes-title) — public compatibility investigations with private operational details removed
+- [melammu-vn](https://github.com/tsukasa-art/melammu-vn) — source-only public reference implementation
+- [Zenn series, part 1](https://zenn.dev/tsukasa_art/articles/mac-eroge-compat-part1) — entry point to the series, not evidence of the current runtime state
+- [Zenn: Wukiyo to Melammu](https://zenn.dev/tsukasa_art/articles/melammu-wukiyo-bridge) — naming transition and series map, not evidence of the current runtime state
+- [Sikarugir](https://github.com/Sikarugir-App/Sikarugir) — credited macOS Wine prior art
 
 ---
+
+# Upstream Wine documentation
+
+The remaining sections are retained from the WineHQ README. The fork-specific
+overview, build notes, patch boundary, and Orrery links are above.
 
 ## INTRODUCTION
 

@@ -1,0 +1,84 @@
+# swingby-wine
+
+[English](README.md)
+
+**swingby-wine**は、Orreryの非公開ランチャー本体**Melammu**で利用する、
+Apple Silicon Mac向けの公開Wine forkです。Windows向けビジュアルノベルをゲーム本体の
+実行ファイルやデータを書き換えず、Macアプリとして扱うための互換処理を実装しています。
+
+[WineHQ Wine 10.0](https://gitlab.winehq.org/wine/wine)のrelease
+`b0738596`を直接のbaseとし、macOS / Rosetta 2向けのWine-side patchをこのrepoで
+管理します。runtime選択、bundle、署名、release policyは非公開Melammuの責任であり、
+ランチャー本体や配布用artifactはここに含みません。
+
+このforkはmacOS Wineの先行事例として
+[Sikarugir](https://github.com/Sikarugir-App/Sikarugir)をcreditしています。
+実行memory処理の一部は、出典を明記した概念移植・非逐語再実装であり、Sikarugirの
+sourceをそのまま取り込んだものではありません。詳細な境界は
+[SWINGBY_PATCHES.md](SWINGBY_PATCHES.md)へ記録しています。
+
+## このリポジトリで確認できること
+
+| 領域 | 主な実装・設計 |
+|---|---|
+| Apple Siliconでの32bit実行 | `wow64cpu`のRosetta対応、`ntdll`の実行memory処理 |
+| macOS固有の表示・window処理 | `winemac.drv`、`win32u`、DirectDraw、WineD3Dの互換対応 |
+| 動画・音声経路 | Quartz、WineGStreamer、DXVA2、DirectSound、CoreAudio周辺の互換対応 |
+| engine / title固有処理の隔離 | `MELAMMU_CMVS_THUMBS`などを明示的なgateで既定OFFにする設計 |
+| patchの出自管理 | WineHQ backport、出典ありの概念移植、独自変更を分ける台帳 |
+
+動作確認の射程は、実際に検証した作品・version・起動経路・runtimeに限定します。
+このrepoはWineのsourceとbuild手順を公開するもので、Melammuの完成appではありません。
+
+## Orreryにおける位置づけ
+
+| 対象 | 役割 |
+|---|---|
+| **Melammu** | Orreryで実際に開発・利用する非公開のmacOSランチャー本体 |
+| **swingby-wine** | Melammuが利用する公開Wine source fork |
+| **[melammu-vn](https://github.com/tsukasa-art/melammu-vn)** | SwiftUI UIと汎用判定を切り出したsource-only公開参照実装。完成ランチャー、runtime同梱版、release配布物ではない |
+
+## 現行graphics runtimeの境界
+
+非公開Melammuは、作品・engineごとの検証結果に基づいてrendererを選びます。
+
+- **WineD3D / OpenGL**は、多くのD3D9・DirectDraw経路の基準です。
+- **DXVK -> Vulkan -> MoltenVK -> Metal**は、検証済みの経路で選択します。
+  WineD3Dを一律に置き換える構成ではありません。
+- D3D9 / DirectDrawをWineD3Dに残し、D3D11だけDXVKへ分けるmixed routeもあります。
+  renderer選択は非公開ランチャー、Wine側patchと既定OFF gateはこのrepoの責任です。
+
+Apple D3DMetal / Game Porting Toolkit componentは、ここで説明する現行runtime構成には
+含めません。
+
+## Build（macOS / Rosetta 2）
+
+Xcode Command Line Toolsとx86_64 Homebrew（`/usr/local/bin/brew`）を使用します。
+
+```bash
+mkdir build && cd build
+arch -x86_64 env \
+  PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig \
+  LDFLAGS="-L/usr/local/lib" CPPFLAGS="-I/usr/local/include" \
+  ../configure -C --enable-win64 --with-mingw \
+  BISON=/usr/local/opt/bison/bin/bison
+arch -x86_64 make -s -j$(sysctl -n hw.activecpu)
+```
+
+build結果はWine artifactであり、Melammuの完成appではありません。private Melammuのscript、
+bundle内path、title別配備手順は公開読者向け手順にしません。統合側ではPE/Unix moduleの
+ABI整合、source revisionとhashの記録、署名・配布条件の確認が別途必要です。
+
+## 関連リンク
+
+- [Orrery — プロジェクト概要](https://tsukasa-art.com/projects/orrery/)
+- [Orrery Case Notes](https://tsukasa-art.com/projects/orrery/#research-notes-title) — privateな運用情報を除いた公開互換調査
+- [melammu-vn — source-only公開参照実装](https://github.com/tsukasa-art/melammu-vn)
+- [Zenn連載 第1回](https://zenn.dev/tsukasa_art/articles/mac-eroge-compat-part1) — 連載の入口。現行runtime状態の証拠ではない
+- [Zenn: WukiyoからMelammuへ](https://zenn.dev/tsukasa_art/articles/melammu-wukiyo-bridge) — 名称変更と連載の地図。現行runtime状態の証拠ではない
+- [Sikarugir](https://github.com/Sikarugir-App/Sikarugir) — macOS Wine開発の先行事例
+
+## License
+
+WineとこのforkはGNU LGPLの条件に従います。詳細は[LICENSE](LICENSE)と
+[COPYING.LIB](COPYING.LIB)を参照してください。

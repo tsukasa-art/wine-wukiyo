@@ -1,202 +1,195 @@
 # Melammu Wine Patch Policy + Ledger (swingby-wine)
 
-Last updated: 2026-07-16
+Last updated: 2026-07-22
 
-This repository is the canonical Wine fork for Melammu. The git base is the
-**vanilla WineHQ Wine 10.0 release** (`b0738596` "Release 10.0.", Alexandre
-Julliard); all macOS/Rosetta work is carried by this fork's own patches
-(60 commits / 93 files changed over the base, Verified at: 2026-07-05 / `git rev-list --count b0738596..b6aff9ef219` + `git diff --shortstat b0738596..b6aff9ef219` — 端点を SHA に固定して数える。HEAD 基準だと台帳 commit 自身で off-by-one が再発する).
-Sikarugir (formerly Kegworks) is historical lineage
-and credit only — measured source delta over WineHQ 10.0 in this repo is zero
-(no Sikarugir commits are carried here). WineHQ is the upstream to rebase onto.
-Melammu runtime behavior must not depend on untracked binaries copied from
-third-party wrappers.
+This repository is the public Wine fork used by the private Melammu launcher.
+Its base is the **vanilla WineHQ Wine 10.0 release** (`b0738596`, "Release
+10.0.", Alexandre Julliard). Moving commit and file counts are deliberately not
+used as project claims.
 
----
+[Sikarugir](https://github.com/Sikarugir-App/Sikarugir) is credited as macOS
+Wine prior art, but its Wine tree is not carried wholesale. Patch `e9a93b3` is
+an attributed conceptual port and non-verbatim reimplementation of two
+Sikarugir executable-memory changes. It is classified separately from original
+fork inventions below.
 
-# Patch Ledger（索引 / 請求書）
+The current [CodeWeavers source page](https://www.codeweavers.com/crossover/source)
+is included as general FOSS credit only. It does not directly substantiate a
+historical CrossOver-release-specific capability decision, and this public
+ledger does not use it as evidence for one.
 
-**目的**: 修正着手のたびに過去ログを漁るのをやめる。「d3d9 で過去に何を触ったか」「SE 崩れを何で直したか」を**この索引から即引ける**。かつ **自前発明 vs 本家 backport の境界**を明示する。下の Policy 以降（責任分界・Patch Classes・Build Artifact Rule）は方針書として保持。ここは請求書。
-
-## 使い方 / 再生成
-
-- **骨格は git から半自動生成**（症状・根因は手で注釈）:
-  - コミット骨格: `git log --date=short --pretty='%h|%ad|%s' b0738596..HEAD`
-  - 差分規模: `git diff --stat b0738596..HEAD`
-  - 自前マーカー分布: `git grep -nE 'swingby|SWINGBY|melammu|MELAMMU|orrery|wukiyo' -- 'dlls/**' 'server/**' 'include/**'`
-  - **rebuild 時はこの3コマンドを再走**し、行が増減していないか差分検知する（drift 検知）。
-- **md5 は重複させない**: load-bearing バイナリの md5・配備先・source commit は [`Melammu/docs/reproducibility-ledger.md`](../Melammu/docs/reproducibility-ledger.md) が正典。ここは「台帳 #N」で指すだけ。
-- **fidelity タグ**: ✅ = git/実機で確定（hard）。🟡 = load-bearing だがコード実読で確定していない（soft）。🟡要確認 = ②/③ 境界がコード実読を要する。
-
-## 3段（provenance）の定義
-
-パッチの**出自**を3段で分ける（下の Patch Classes = core/gated/experimental は直交する「配備ステータス」軸で、別列）。
-
-- **① 素の Wine 10.0** — 触っていない（base 以降なので定義上ゼロ件）。
-- **② upstream backport / 借用** — 10.0 以降の本家 fix の cherry-pick、または第三者 patch の rebase。汎用 Wine 改善の性格。
-- **③ 自前発明** — swingby/melammu マーカー付き、または macOS/Rosetta/CMVS/Melammu 固有の独自実装。**「自分が当てた内容」はこの段を見れば一望できる**。
-
-**全56コミットが単一 author（fork owner）**＝author では段を判別できない。分類は commit message 語彙（Backport/Original-author/底本）＋マーカー導入有無＋パッチ内容に依拠（✅ git 由来 / 🟡 境界はコード実読要）。件数は再生成コマンドで確認し、`b0738596..b6aff9ef219`（2026-07-05）時点は **② 11 / ③ 34 / D(doc・chore・build・merge) 15**。
-
-## ③ 自前発明（＝自分が当てた内容の一望）
-
-論理パッチ単位（反復コミットは範囲に畳んだ）。file:function は代表箇所。
-
-| # | commit(s) / date | file:function | 症状 / 目的 | engine/game | 根因ポインタ | md5(台帳#) | class |
-|---|---|---|---|---|---|---|---|
-| 1 | `d053267`(05-26)〜`15b45c6`(06-14, ~20 commits)・堅牢化 `b6aff9ef219`+`6432d63fc76`(07-05・Codex review済) | `dlls/d3d9/surface.c` / `device.c` / `swapchain.c` / `d3d9_main.c` ＋ `dlls/wined3d/swapchain.c`（＋vendored `stb_image_write.h`） | CMVS セーブ画面サムネが黒。back-buffer READONLY lock で last-presented frame を serve、UnlockRect counter で 192x108 検出→injection。`surface.c:swingby_patch_dat_file_impl` には CMVS `.dat` 直接書換え能力も残る（gate 内・破壊的能力なので反応的に剥がさず ledger 対象）。07-05 堅牢化（FULL_AUDIT W-H2/W-H3）: swapchain.c 版 snap 注入を device.c 版と同じ gate 下に置き、両 reader を 12byte ヘッダ準拠に（`swingby_inject_snap_file()` 共通化）、writer のヘッダ stride を実レイアウト(w*4 packed)に訂正、`d3d9_main.c` の無条件 `swingby_d3d9_loaded.txt` マーカーを除去 | CMVS | `research/state/thumbnail.md`、`journeys/2026-06-28-hamidashi-thumbnail-gl-readback-black-rootcause.md` | 台帳外（bundled wine builtin d3d9） | Engine Gated `MELAMMU_CMVS_THUMBS`（`b6aff9ef219` で gate 主張がコード実態と一致）🟡潜在的に脆い（正解は launcher SCK single-writer＝thumbnail.md 参照。per-game d3d9 経路は反応的に剥がさない） |
-| 2 | `dad6d47`(05-13)・掃除 `b6aff9ef219`(07-05) | `dlls/winemac.drv/image.c: macdrv_GetImage` | GDI BitBlt が Metal 描画窓で黒を返す→CGWindowList で窓内容を捕捉。07-05 掃除（FULL_AUDIT W-H3）: ungated `/tmp/macdrv_debug.log` append（GetImage×3・gdi.c CreateCompatibleDC）を除去、ログ専用 `macdrv_PutImage` hook を撤去（upstream dispatch 復帰・DIB 描画エンジンでの無限成長ログ＝jetsam リスク解消） | winemac 全般 | `research/state/thumbnail.md` | 台帳外（bundled winemac） | Core Required |
-| 3 | `0491875`(06-13) | `dlls/wow64cpu/cpu.c` | 32bit ゲームが Rosetta で c0000005。far-call を ljmp→lretq に thunk | 全32bit game | `journeys/2026-06-13-wine-prot-exec-map-file-into-view-fix.md`（関連） | 台帳外（bundled wow64cpu） | Core Required ✅ |
-| 4 | `b585585`(06-13) | `dlls/ntdll/loader.c` | delay-load IAT を patch 前に PAGE_READWRITE 化（mingw binutils≥2.43 ld bug 32675 回避） | macOS toolchain | — | 台帳外（bundled ntdll） | Core Required ✅ |
-| 5 | `e9a93b3`(06-12) | `dlls/ntdll/unix/virtual.c` | macOS AMFI が PROT_EXEC mmap を拒否→PROT なし mmap→mprotect で exec 付与 | 全 game | `journeys/2026-06-13-wine-prot-exec-map-file-into-view-fix.md` | 台帳外（bundled ntdll） | Core Required 🟡要確認（Sikarugir out-of-tree から concept port＝②寄りの境界） |
-| 6 | `e96197a`(06-12) | `dlls/win32u/window.c` | NtUserSetWindowLong の self-referencing subclass で stack overflow | yaneurao GameSDK | — | 台帳外（bundled win32u） | Core Required |
-| 7 | `d294887`(06-13), `d1fa6f3`+`3b6256b`(06-23), `b4a6cfb`(06-25), `8d4919b`(06-30) | `dlls/winemac.drv/{opengl.c,window.c,cocoa_window.m}` | GL-over-Metal overlay（DXVK/MoltenVK 窓上に D3D9/GL を present）／画面外窓の中央復帰／OnMainThread 再入 deadlock／movie「白」時の overlay un-hide | winemac（DXVK 描画・movie） | `research/state/movie.md`、`journeys/2026-06-30-hamidashi-movie-white-dxvk-metal-wined3d-overlay-journey.md` | #3, #4（winemac.drv PE / winemac.so） | Core Required（`b4a6cfb` は 🟡要確認＝汎用 deadlock fix） |
-| 8 | `0aba0f6`(06-29) | `dlls/dsound/mixer.c: swingby_clamp_float_mix` | in-game SE/BGM の float mix クリップノイズを [-1,1] に saturate | title gated（Hamidashi） | `research/state/audio.md` | #8（Hamidashi dsound） | Engine/Title Gated |
-| 9 | `bee6762`(06-29) | `dlls/dsound/primary.c` | app 要求 primary rate が device より高い時にデバイス再オープン（SRC を CoreAudio へ offload） | title gated（Hamidashi） | `research/state/audio.md` | #8 | Engine/Title Gated |
-| 10 | `5aed1fc`(07-04) | `dlls/imagehlp/integrity.c: ImageGetDigestStream` | SoftDenchi `UCOpgDlg.dll` 自己署名検証を通す per-section PE digest（c0000142 解消） | SoftDenchi DRM | メモリ [[softdenchi-blocked-by-wine-imagehlp-authenticode-mismatch]] | #16, #17 | 旧 Experimental→現 shared 🟡要確認（汎用 Wine correctness としても筋が通る） |
-| 11a | `8d4919b`(06-30, master) | `dlls/ddraw/surface.c` + `dlls/winemac.drv/*` | ddraw/VMR-7 front-buffer movie を DXVK/Metal 上に表示（overlay un-hide + surface early-ready）。共有 ddraw/winemac 側の movie 白 fix | Furukiss/GIGA・Hamidashi movie | `research/state/movie.md`, `journeys/2026-06-30-hamidashi-movie-white-dxvk-metal-wined3d-overlay-journey.md` | #3,#4,#6a,#6b,#13-15 | Core Required / title overlay source |
-| 11b | `1ae2460`(topic: `origin/quartz-dsound-startup-avsync` / `verify/hamidashi-quartz-logo-avsync`) | `dlls/quartz/filtergraph.c` / `dsoundrender.c` | Hamidashi startup logo route（`MELAMMU_LOGO_*` env-gated Null Renderer / 200ms delay skip）＋ movie pre-roll `cur < 0` 連続扱い。shared master ではなく title-local `quartz.dll` artifact の source | Hamidashi logo | `research/state/movie.md`, `Melammu/docs/reproducibility-ledger.md` #11 | #11 | Title Gated / topic branch source |
-| 12 | `6c217e5`(07-06, master) | `dlls/winecoreaudio.drv/coreaudio.c: unix_get_endpoint_ids` | 音声エンドポイント列挙を現在の system-default 1個に絞る。DirectShow RenderFile が全 output/input デバイスの format caps を HAL でプローブ（BlackHole/複数出力装置で増幅）するのを削減。デバイス選択は macOS の仕事＝Wine は既定出力に追従のみ。default 解決不可なら stock 全列挙に fallback。furukiss OP 白 -0.37s(11%) | 全 game（shared・DirectSound/mmdevapi 経路） | メモリ [[wine-audio-expose-default-device-only]]、[[furukiss-movie-white-is-audio-device-enum-not-gstreamer]]、`research/state/movie.md` | 台帳外（bundled winecoreaudio.so・md5 `ca05fe51`） | shared（全 game・default-only enum・fallback で stock 挙動）✅実機非回帰(furukiss OP音声＋reallive/ナツユメナギサ・2026-07-06) |
-| 13 | candidate（07-16、source-audit batch） | `dlls/ddraw/surface.c: ddraw_surface_blt_clipped` | VMR7 の non-empty clip rectangle が windowed primary surface bounds を越える時だけ destination を intersect し、original destination/source から一度で source crop。`DDERR_INVALIDRECT` を回避し、in-bounds・他 clipper mode・empty fallback は保持 | Pieces／揺り籠のカナリア、渡り鳥のソムニウム | `../Melammu/docs/reviews/batches/20260716-pieces-vmr7-invalidrect-fix/implementation-01.md` | candidate i386 `f217c4a...` / x86_64 `7c4782de...`（accepted #6a/#6b への昇格前） | High-risk shared candidate。揺り籠 fixed-run＋渡り鳥 PASS、Furukiss は title-local overlay 経路。cs2/artemis は独立監査の残余 risk |
-
-## ② upstream backport / 借用
-
-汎用 Wine fix の性格。macOS 固有マーカーをほぼ持たない。
-
-| # | commit(s) / date | file:function | 内容 | 根因ポインタ | md5(台帳#) | 段判定 |
-|---|---|---|---|---|---|---|
-| B1 | `baf3e94`(06-30) | `dlls/ntdll/unix/msync.{c,h}` ＋ `server/msync.{c,h}` ＋ `server/*` | msync(mach semaphore)。**底本 marzent/wine-msync (LGPL2.1)** を Wine10.0 へ rebase。in-process 同期＝movie「白」(~5.16s) 解消 | メモリ [[nukitashi-movie-white-is-startup-latency]]、`research/state/movie.md` | #1, #2 | ②（借用ベース・macOS 適合は自前）🟡 |
-| B2 | `6bbb4f4`(06-25) | `dlls/mf/topology_loader.c` | 動画変換で color converter を既定に。**明示 backport** upstream `774bbd4153c` / Original-author Rémi Bernon (CodeWeavers) | — | — | ② ✅（明示 backport） |
-| B3 | `5fc3eac`(06-25) | `dlls/winegstreamer/{color_convert,video_processor}.c` | MFT output type を補完し EVR mixer に通す | `journeys/2026-06-27-hamidashi-op-audio-starvation-winegstreamer-multiqueue-journey.md` | — | ② 🟡要確認 |
-| B4 | `61dc20e`+`29cfa3b`(06-22), `aa872c7`+`6f32d23`(06-23) | `dlls/quartz/{vmr7,vmr9,vmr7_presenter,filtergraph}.c` ＋tests | VMR7/9 image presenter 実装・present rect・graph lock 回避（EOS deadlock）・RGB24 対応 | `journeys/2026-06-23-...evr-white-thumbnail-black-journey.md`、`journeys/2026-06-25-galsfiction-...-evr-black-journey.md` | #9-#11 | ② 🟡要確認（汎用 quartz 実装・test 付） |
-| B5 | `3b4d01e`(06-24) | `dlls/ddraw/surface.c` | 空 clip list 時の unclipped windowed primary blt（Furukiss/GIGA VMR7 OP 黒対策） | `journeys/2026-06-24-furukiss-s-giga-op-movie-black-journey.md` | #6a, #6b | ② 🟡要確認 |
-| B6 | `cb07279`(06-23) | `dlls/dxva2/main.c` | video processor render target を実 RT で作成（macOS GL FBO 起因） | — | — | ② 🟡要確認 |
-| B7 | `8ca998d09e4`(07-15) | `dlls/user32/{user32.spec,win.c}:IsWindowArranged` | DMM GAME PLAYER 5.5.13 / Electron 42.5.0 が delay-load する `IsWindowArranged` を WineHQ `a7d7024479e` から backport。未 export 時は `ERROR_PROC_NOT_FOUND(127)` → Chromium ImmediateCrash。upstream 同様 `FALSE` を返す stub で、隔離 runtime にて login window 生存・Crashpad dump 0 を確認 | `../Melammu/docs/reviews/handoffs/2026-07-15-dmm-5.5.13-iswindowarranged.md` | 台帳追加前（bundle 未配備） | ② ✅（WineHQ 10.8 upstream backport） |
-
-## D — doc / chore / merge（コード非改変・12件）
-
-索引の対象外（README/PATCHES 編集・`wukiyo→swingby` リネーム `bf97c45`・gitignore・merge `e4cea6c`）。機能不変。必要時は `git log --grep` で辿る。
-
-## 要確認リスト（コード実読で②/③境界を確定すべき）
-
-以下は commit message とマーカーだけでは段が確定せず、コード diff の実読が要る。**load-bearing になる前に実物で昇格**（メモリ [[feedback-fidelity-tag-and-load-bearing-promotion]]・全部は verify しない）:
-
-1. `baf3e94` msync — 借用(marzent LGPL2.1)ベース＋macOS 適合の自前調整。②か「借用ベースの自前」か。差分最大(~3,500行)。
-2. `e9a93b3` PROT_EXEC — Sikarugir から "concept, not verbatim" port。②(backport)か③(再実装)か移植度次第。
-3. `5fc3eac`/`b4a6cfb`/`3b4d01e`/`6f32d23`/`cb07279`/`aa872c7`/`61dc20e`/`29cfa3b` — quartz/winegstreamer/ddraw/dxva2 の 8件。汎用 Wine fix の性格だが upstream 由来の明記なし＋macOS 面が絡む。「upstream-shaped な自前実装」か「未 push の backport 候補」か。
-4. `5aed1fc` imagehlp — 汎用 Wine 正当性向上だが動機は SoftDenchi。②/③ どちらでも筋が通る。
-5. `stb_image_write.h` — 第三者 public-domain lib の vendoring。①②③ でなく「vendored dependency」の第4カテゴリが要るか。
+The public [melammu-vn](https://github.com/tsukasa-art/melammu-vn) repository is
+a source-only reference implementation. It is not the complete launcher and
+does not contain Melammu's runtime selection, title profiles, private evidence,
+or release artifacts.
 
 ---
 
-## Responsibility Boundary
+# Patch Ledger
+
+This ledger separates source provenance from deployment status. Commit hashes
+identify public source history; they are not fixed-size project claims.
+
+## Reading the ledger
+
+- **Provenance** describes where an implementation came from.
+- **Class** describes whether the patch is shared, gated, or experimental.
+- **Related Case Note** points to public technical background. It is not a claim
+  that the Case Note directly proves every implementation detail in that row.
+- Private launcher paths, deployment scripts, operational records, and artifact
+  manifests are intentionally not linked here.
+
+## Provenance categories
+
+- **① WineHQ Wine 10.0 base** — unchanged upstream source.
+- **② Upstream backport / borrowed base** — later WineHQ fixes or attributed
+  third-party work rebased onto Wine 10.0.
+- **②-B Attributed conceptual port** — source-attributed ideas reimplemented
+  non-verbatim for this fork.
+- **③ Original fork change** — implementation developed in this fork without
+  claiming third-party source authorship.
+
+Authorship alone does not establish provenance. Classification follows commit
+messages, source attribution, and direct code review.
+
+## ③ Original fork changes
+
+| # | commit(s) | representative area | purpose | related Case Note | class |
+|---|---|---|---|---|---|
+| 1 | `d053267`–`15b45c6`; hardening `b6aff9ef219` + `6432d63fc76` | `dlls/d3d9/*`, `dlls/wined3d/swapchain.c` | Keep last-presented-frame and snapshot injection behind a default-off gate | [save thumbnail](https://tsukasa-art.com/projects/orrery/notes/save-thumbnail-black/) | Engine Gated: `MELAMMU_CMVS_THUMBS` |
+| 2 | `dad6d47`; cleanup `b6aff9ef219` | `dlls/winemac.drv/image.c` | Improve GDI capture behavior for a macOS-rendered window and remove debug-only writes | [save thumbnail](https://tsukasa-art.com/projects/orrery/notes/save-thumbnail-black/) | Core Required |
+| 3 | `0491875` | `dlls/wow64cpu/cpu.c` | Replace a Rosetta-sensitive 32-bit far-call path with a compatible thunk | [executable-memory background](https://tsukasa-art.com/projects/orrery/notes/mmap-exec-launch-crash/) | Core Required |
+| 4 | `b585585` | `dlls/ntdll/loader.c` | Make delay-load IAT pages writable before patching | — | Core Required |
+| 6 | `e96197a` | `dlls/win32u/window.c` | Guard self-referencing window subclass updates | — | Core Required |
+| 7 | `d294887`, `d1fa6f3` + `3b6256b`, `b4a6cfb`, `8d4919b` | `dlls/winemac.drv/*` | Coordinate DXVK/MoltenVK drawing with WineD3D/DirectDraw movie presentation | [movie white screen](https://tsukasa-art.com/projects/orrery/notes/movie-white-screen/) | Core Required; some boundaries remain under review |
+| 8 | `0aba0f6` | `dlls/dsound/mixer.c` | Saturate float mixing to the valid range | — | Engine / Title Gated |
+| 9 | `bee6762` | `dlls/dsound/primary.c` | Leave sample-rate conversion to CoreAudio for a gated route | — | Engine / Title Gated |
+| 10 | `5aed1fc` | `dlls/imagehlp/integrity.c` | Improve per-section PE digest compatibility | — | Shared; provenance classification remains under review |
+| 11a | `8d4919b` | `dlls/ddraw/surface.c`, `dlls/winemac.drv/*` | Present a VMR-7 front-buffer movie through a mixed graphics window | [movie white screen](https://tsukasa-art.com/projects/orrery/notes/movie-white-screen/) | Core Required |
+| 11b | `1ae2460` | `dlls/quartz/filtergraph.c`, `dsoundrender.c` | Gate startup-logo and movie pre-roll behavior | [first-load lifecycle](https://tsukasa-art.com/projects/orrery/notes/movie-first-load-after-app-update/) | Title Gated |
+| 12 | `6c217e5` | `dlls/winecoreaudio.drv/coreaudio.c` | Prefer the system-default endpoint with stock enumeration as fallback | — | Shared |
+| 13 | `1471f547fba` | `dlls/ddraw/surface.c` | Intersect an out-of-bounds destination and proportionally crop the source | — | High-risk shared change; limited to verified routes |
+
+## ②-B Attributed conceptual port / non-verbatim reimplementation
+
+| # | commit | representative area | source boundary | related Case Note | class |
+|---|---|---|---|---|---|
+| 5 | `e9a93b3` | `dlls/ntdll/unix/virtual.c` | Conceptually follows Sikarugir executable-memory work, but reimplements the behavior non-verbatim on the WineHQ 10.0 base | [mmap / executable memory](https://tsukasa-art.com/projects/orrery/notes/mmap-exec-launch-crash/) | Core Required |
+
+## ② Upstream backports / borrowed bases
+
+| # | commit(s) | representative area | source boundary | related Case Note | class |
+|---|---|---|---|---|---|
+| B1 | `baf3e94` | `dlls/ntdll/unix/msync.*`, `server/msync.*` | `marzent/wine-msync` LGPL-2.1 base rebased onto Wine 10.0, with macOS adaptation maintained here | — | Borrowed base; adaptation boundary remains under review |
+| B2 | `6bbb4f4` | `dlls/mf/topology_loader.c` | Explicit WineHQ backport of `774bbd4153c`; original author Rémi Bernon (CodeWeavers) | — | Upstream backport |
+| B3 | `5fc3eac` | `dlls/winegstreamer/{color_convert,video_processor}.c` | Upstream-shaped media-foundation compatibility work; exact provenance remains under review | [movie / audio starvation](https://tsukasa-art.com/projects/orrery/notes/movie-audio-starvation/) | Under review |
+| B4 | `61dc20e` + `29cfa3b`, `aa872c7` + `6f32d23` | `dlls/quartz/*` | VMR7/9 presenter, rectangle, graph-lock, and RGB24 work | [movie white screen](https://tsukasa-art.com/projects/orrery/notes/movie-white-screen/) | Under review |
+| B5 | `3b4d01e` | `dlls/ddraw/surface.c` | Windowed-primary blit behavior for an empty clip list | [movie white screen](https://tsukasa-art.com/projects/orrery/notes/movie-white-screen/) | Under review |
+| B6 | `cb07279` | `dlls/dxva2/main.c` | Create the video-processor render target from the actual target resource | — | Under review |
+| B7 | `8ca998d09e4` | `dlls/user32/{user32.spec,win.c}` | Backport the `IsWindowArranged` stub from WineHQ `a7d7024479e` | [Electron launcher](https://tsukasa-art.com/projects/orrery/notes/electron-windows-launcher-on-wine/) | WineHQ backport |
+
+## Items still requiring provenance review
+
+- `baf3e94`: borrowed msync base versus fork-specific macOS adaptation.
+- Media and DirectDraw group: whether each change is an unpublished backport or
+  an independently implemented upstream-shaped fix.
+- `5aed1fc`: generic Wine correctness versus application-driven motivation.
+- `stb_image_write.h`: vendored public-domain dependency, outside the three
+  implementation categories above.
+
+---
+
+## Responsibility boundary
 
 `swingby-wine` owns:
 
 - Wine behavior patches.
 - Patch gates and default-off behavior.
-- Regression surface and compatibility notes for each patch class.
-- Reproducible build inputs for artifacts shipped by Melammu.
+- Regression surfaces and compatibility notes for each patch class.
+- Reproducible Wine-side build inputs.
 
-`Melammu` owns:
+The private `Melammu` project owns:
 
-- Prefix lifecycle and game data lifecycle.
+- Prefix and game-data lifecycle.
 - Engine detection and per-engine policy.
-- Runtime selection, `WINEPREFIX`, `WINEDLLPATH`, GStreamer, DXVK, and DLL
-  override policy.
-- Per-title feature flags.
-- The bundled runtime manifest under `docs/wine-runtime-manifest.md`.
+- Runtime selection, GStreamer, DXVK, MoltenVK, and DLL override policy.
+- Per-title feature flags, artifact hashes, signing, deployment, and rollback.
 
-## Canonical Branch Policy
+The public `melammu-vn` repository owns none of those runtime responsibilities.
+It is a source-only reference implementation for a curated SwiftUI library UI
+and generic engine detection.
 
-Target policy:
+## Current OSS runtime composition
 
-- Public default / canonical branch: `master` (Wine fork convention; no `main` branch).
-- `master` contains Melammu's supported Wine patch set.
-- Phase 0 authority is the runtime content currently used by the Melammu
-  launcher, not an existing branch name or version string.
-- v1 `master` is the minimal clean fork needed to reproduce the current Melammu
-  bundle (no Wine version upgrade; stays on the WineHQ 10.0 base).
-- Experimental game-specific probes live on topic branches and are not bundled
-  until promoted by a manifest update.
-- Launcher state, agent state, local research notes, and build directories do
-  not belong in public history.
+The graphics model is selected per engine and title; it is not one global
+renderer:
 
-Current Phase 0 source candidate:
+- **WineD3D / OpenGL** is the baseline for many D3D9 and DirectDraw routes.
+- **DXVK -> Vulkan -> MoltenVK -> Metal** is used for verified D3D11 and
+  selected D3D9 routes. Some routes must keep D3D9 on WineD3D.
+- **Mixed routing** is intentional: D3D9 or DirectDraw can remain builtin while
+  D3D11 uses DXVK. WineGStreamer / GStreamer, Quartz, DirectSound, and CoreAudio
+  cover the media and audio sides of the runtime.
 
-```text
-e6310c904ca5ddc9d8a78017057ba9f661c2f57a
-feat(d3d9,wined3d): MELAMMU_CMVS_THUMBS ...
-```
+Apple D3DMetal / Game Porting Toolkit components are not part of the current
+runtime described by this ledger.
 
-This commit is a candidate source explanation for the current Melammu bundle,
-but the bundle is authoritative until a clean rebuild proves equivalence by
-feature probes and hashes.
+## Canonical branch policy
 
-v1 `master` includes:
+- Public default and canonical branch: `master` (Wine fork convention; no
+  `main` branch).
+- `master` contains the public Wine-side source set accepted for integration.
+- Experimental game-specific probes remain on topic branches until promoted by
+  an explicit source decision.
+- Launcher state, private operational records, and build directories do not
+  belong in public history.
 
-- Core patches required by the current Melammu bundle.
-- `MELAMMU_CMVS_THUMBS` as a default-off engine gate.
-
-v1 `master` excludes:
-
-- SoftDenchi WTS / crypt32 work.
-- Wine version upgrades.
-- `wine64/` integration into this fork (wine64 stays a separate
-  launcher-bundled compatibility runtime under `wine-support/wine64/`).
-- Title policy, fallback policy, and launcher policy.
-
-SoftDenchi-related work after that point is experimental/post-v1 and must not
-be included in the canonical v1 runtime without a separate gate:
-
-```text
-930fe5b75a5... wtsapi32 WTS session nudge (`verify/softdenchi-wts-session`)
-635d5380509... crypt32 CryptBinaryToStringA(CRYPT_STRING_HEX) (`verify/softdenchi-wts-session`)
-```
-
-## Patch Classes
+## Patch classes
 
 ### Core Required
 
-These patches are part of the supported Melammu Wine runtime and should be
-carried by the canonical branch.
+Shared Wine behavior required by supported routes, including the Rosetta-aware
+32-bit path, delay-load protection, executable-memory handling, window subclass
+guard, and macOS window behavior.
 
-- `dlls/wow64cpu/cpu.c`: Rosetta-aware far-call thunking for 32-bit games.
-- `dlls/ntdll/loader.c`: make delay-load IAT writable before patching.
-- `dlls/ntdll/unix/virtual.c`: avoid initial executable file mappings on
-  macOS, then apply executable protection explicitly.
-- `dlls/win32u/window.c`: guard self-referencing window subclass updates.
-- `dlls/winemac.drv/*`: macOS window behavior and capture support used by
-  Melammu.
+### Engine / Title Gated
 
-### Engine Gated
-
-These patches must be default-off inside Wine and enabled by Melammu only for
-the engine/title policy that requires them.
-
-- CMVS thumbnail capture and last-presented back-buffer serving.
-- Gate: `MELAMMU_CMVS_THUMBS`.
-- IPC contract: `/tmp/melammu_snap_NNN.bgra` with
-  `[u32 width][u32 height][u32 stride] + BGRA pixels`, plus
-  `/tmp/melammu_page_base.txt`.
+Compatibility behavior that must remain default-off and be enabled only by an
+explicit launcher policy. `MELAMMU_CMVS_THUMBS` is the public example of this
+boundary.
 
 ### Experimental / Post-v1
 
-These patches are not part of the v1 canonical runtime until explicitly
-promoted.
+Unpromoted probes are not part of the canonical runtime until they pass a
+separate source, artifact, and regression decision.
 
-- `dlls/wtsapi32/wtsapi32.c`: WTS session nudge for SoftDenchi experiments.
-- `dlls/crypt32/base64.c`: `CryptBinaryToStringA(CRYPT_STRING_HEX)` work until
-  promoted as a generic Wine compatibility fix.
+## Build artifact rule
 
-## Build Artifact Rule
+Runtime artifacts must be tied back to source by content, not timestamps:
 
-The shipped Melammu runtime must be tied back to source by content, not by
-mtime. Before publishing or rebasing:
+1. Build from the intended public source commit.
+2. Keep PE and Unix-side modules ABI-matched.
+3. Record source revision, feature probes, and hashes in the integrating
+   project's private records.
+4. Verify that experimental patches are absent unless explicitly selected.
 
-1. Build from the intended canonical commit.
-2. Bundle into Melammu.
-3. Record the commit, feature probes, and SHA-256 hashes in Melammu's
-   `docs/wine-runtime-manifest.md`.
-4. Verify that experimental patches are absent unless the manifest explicitly
-   says otherwise.
+These are maintainer gates, not public instructions for assembling the private
+Melammu launcher.
+
+## Credits and license
+
+- WineHQ Wine 10.0 is the upstream base and is licensed under the GNU LGPL.
+- Sikarugir is credited for macOS Wine prior art and the concept behind patch
+  `e9a93b3`; its source is not copied verbatim.
+- `marzent/wine-msync` is credited as the LGPL-2.1 base for B1.
+- WineHQ and original authors, including CodeWeavers contributors, retain their
+  attribution on backported commits.
+- See [LICENSE](LICENSE) and [COPYING.LIB](COPYING.LIB).
+
+## Public navigation
+
+- [Orrery overview](https://tsukasa-art.com/projects/orrery/)
+- [Orrery Case Notes](https://tsukasa-art.com/projects/orrery/#research-notes-title)
+- [melammu-vn source-only reference](https://github.com/tsukasa-art/melammu-vn)
+- [Zenn series, part 1](https://zenn.dev/tsukasa_art/articles/mac-eroge-compat-part1) — entry point to the series, not evidence of the current runtime state
+- [Zenn: Wukiyo to Melammu](https://zenn.dev/tsukasa_art/articles/melammu-wukiyo-bridge) — naming transition and series map, not evidence of the current runtime state
