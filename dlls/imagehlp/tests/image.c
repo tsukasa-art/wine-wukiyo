@@ -307,56 +307,31 @@ static void free_updates(struct update_accum *accum)
     accum->cUpdates = 0;
 }
 
+/* Current ImageGetDigestStream (dlls/imagehlp/integrity.c) reports, in order:
+ * 1. the headers through the end of the section table (not the header
+ *    padding out to SizeOfHeaders), with CheckSum and the
+ *    IMAGE_DIRECTORY_ENTRY_SECURITY data directory entry blanked -- both
+ *    already zero in this fixture, so only CheckSum needs zeroing below;
+ * 2. every section's raw data, in section-table order, skipping sections
+ *    with SizeOfRawData == 0 (.bss here).
+ * DigestLevel is not consulted, so flags = 0 and
+ * flags = CERT_PE_IMAGE_DIGEST_ALL_IMPORT_INFO produce an identical stream;
+ * a1/a2 and a3/a4 intentionally share expectations. */
 static const struct expected_blob b1[] = {
-    {FILE_PE_START,  &bin},
-    /* with zeroed Checksum/SizeOfInitializedData/SizeOfImage fields */
-    {sizeof(bin.nt_headers), &bin.nt_headers},
-    {sizeof(bin.sections),  &bin.sections},
-    {FILE_IDATA-FILE_TEXT, &bin.text_section},
-    {sizeof(bin.idata_section.descriptors[0].OriginalFirstThunk),
-        &bin.idata_section.descriptors[0].OriginalFirstThunk},
-    {FIELD_OFFSET(struct imports, thunks)-
-        (FIELD_OFFSET(struct imports, descriptors)+FIELD_OFFSET(IMAGE_IMPORT_DESCRIPTOR, Name)),
-        &bin.idata_section.descriptors[0].Name},
-    {FILE_TOTAL-FILE_IDATA-FIELD_OFFSET(struct imports, ibn),
-        &bin.idata_section.ibn}
-};
-static const struct expected_update_accum a1 = { ARRAY_SIZE(b1), b1, TRUE };
-
-static const struct expected_blob b2[] = {
-    {FILE_PE_START,  &bin},
-    /* with zeroed Checksum/SizeOfInitializedData/SizeOfImage fields */
-    {sizeof(bin.nt_headers), &bin.nt_headers},
-    {sizeof(bin.sections),  &bin.sections},
+    {FILE_PE_START + sizeof(bin.nt_headers) + sizeof(bin.sections), &bin},
     {FILE_IDATA-FILE_TEXT, &bin.text_section},
     {FILE_TOTAL-FILE_IDATA, &bin.idata_section}
 };
-static const struct expected_update_accum a2 = { ARRAY_SIZE(b2), b2, FALSE };
+static const struct expected_update_accum a1 = { ARRAY_SIZE(b1), b1, FALSE };
+static const struct expected_update_accum a2 = { ARRAY_SIZE(b1), b1, FALSE };
 
 static const struct expected_blob b3[] = {
-    {FILE_PE_START,  &bin64},
-    /* with zeroed Checksum/SizeOfInitializedData/SizeOfImage fields */
-    {sizeof(bin64.nt_headers), &bin64.nt_headers},
-    {sizeof(bin64.sections),  &bin64.sections},
-    {FILE_IDATA - FILE_TEXT, &bin64.text_section},
-    {sizeof(bin64.idata_section.descriptors[0].OriginalFirstThunk),
-     &bin64.idata_section.descriptors[0].OriginalFirstThunk},
-    {FIELD_OFFSET(struct imports64, thunks) -
-     (FIELD_OFFSET(struct imports64, descriptors) + FIELD_OFFSET(IMAGE_IMPORT_DESCRIPTOR, Name)),
-     &bin64.idata_section.descriptors[0].Name},
-    {FILE_TOTAL - FILE_IDATA - FIELD_OFFSET(struct imports64, ibn), &bin64.idata_section.ibn}
-};
-static const struct expected_update_accum a3 = { ARRAY_SIZE(b3), b3, TRUE };
-
-static const struct expected_blob b4[] = {
-    {FILE_PE_START,  &bin64},
-    /* with zeroed Checksum/SizeOfInitializedData/SizeOfImage fields */
-    {sizeof(bin64.nt_headers), &bin64.nt_headers},
-    {sizeof(bin64.sections),  &bin64.sections},
+    {FILE_PE_START + sizeof(bin64.nt_headers) + sizeof(bin64.sections), &bin64},
     {FILE_IDATA - FILE_TEXT, &bin64.text_section},
     {FILE_TOTAL - FILE_IDATA, &bin64.idata_section}
 };
-static const struct expected_update_accum a4 = { ARRAY_SIZE(b4), b4, FALSE };
+static const struct expected_update_accum a3 = { ARRAY_SIZE(b3), b3, FALSE };
+static const struct expected_update_accum a4 = { ARRAY_SIZE(b3), b3, FALSE };
 
 /* Creates a test file and returns a handle to it.  The file's path is returned
  * in temp_file, which must be at least MAX_PATH characters in length.
@@ -432,10 +407,10 @@ static void test_get_digest_stream(void)
     WriteFile(file, &bin, sizeof(bin), &count, NULL);
     FlushFileBuffers(file);
 
-    /* zero out some fields ImageGetDigestStream would zero out */
+    /* zero the field ImageGetDigestStream blanks before hashing (the
+     * IMAGE_DIRECTORY_ENTRY_SECURITY data directory entry is already zero
+     * in this fixture) */
     bin.nt_headers.OptionalHeader.CheckSum = 0;
-    bin.nt_headers.OptionalHeader.SizeOfInitializedData = 0;
-    bin.nt_headers.OptionalHeader.SizeOfImage = 0;
 
     ret = ImageGetDigestStream(file, 0, accumulating_stream_output, &accum);
     ok(ret, "ImageGetDigestStream failed: %ld\n", GetLastError());
@@ -464,8 +439,6 @@ static void test_get_digest_stream(void)
     FlushFileBuffers(file);
 
     bin64.nt_headers.OptionalHeader.CheckSum = 0;
-    bin64.nt_headers.OptionalHeader.SizeOfInitializedData = 0;
-    bin64.nt_headers.OptionalHeader.SizeOfImage = 0;
 
     ret = ImageGetDigestStream(file, 0, accumulating_stream_output, &accum);
     ok(ret, "ImageGetDigestStream failed: %lu\n", GetLastError());
