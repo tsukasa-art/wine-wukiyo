@@ -36,6 +36,7 @@ sourceをそのまま取り込んだものではありません。詳細な境�
 |---|---|
 | **Melammu** | Orreryで実際に開発・利用する非公開のmacOSランチャー本体 |
 | **swingby-wine** | Melammuが利用する公開Wine source fork |
+| **[swingby-dxvk](https://github.com/tsukasa-art/swingby-dxvk)** | Melammuが利用する公開DXVK source fork（MoltenVK/Apple Silicon互換性修正） |
 | **[melammu-vn](https://github.com/tsukasa-art/melammu-vn)** | SwiftUI UIと汎用判定を切り出したsource-only公開参照実装。完成ランチャー、runtime同梱版、release配布物ではない |
 
 ## 公開ブランチ
@@ -88,6 +89,7 @@ ABI整合、source revisionとhashの記録、署名・配布条件の確認が�
 
 - [Orrery — プロジェクト概要](https://tsukasa-art.com/projects/orrery/)
 - [Orrery Case Notes](https://tsukasa-art.com/projects/orrery/#research-notes-title) — privateな運用情報を除いた公開互換調査
+- [swingby-dxvk — 公開DXVK fork](https://github.com/tsukasa-art/swingby-dxvk)
 - [melammu-vn — source-only公開参照実装](https://github.com/tsukasa-art/melammu-vn)
 - [Zenn連載 第1回](https://zenn.dev/tsukasa_art/articles/mac-eroge-compat-part1) — 連載の入口。現行runtime状態の証拠ではない
 - [Zenn: WukiyoからMelammuへ](https://zenn.dev/tsukasa_art/articles/melammu-wukiyo-bridge) — 名称変更と連載の地図。現行runtime状態の証拠ではない

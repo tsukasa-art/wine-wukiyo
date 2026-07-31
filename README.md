@@ -37,6 +37,10 @@ a source-only reference implementation extracted from Melammu. It exposes a
 curated SwiftUI library UI and generic engine detection; it is not the complete
 launcher, a runtime bundle, or a public release of Melammu.
 
+[swingby-dxvk](https://github.com/tsukasa-art/swingby-dxvk) is a sibling public
+fork, following the same model for a DXVK 2.4.1 base with MoltenVK/Apple
+Silicon compatibility patches.
+
 ## Runtime dependency
 
 x86→ARM translation currently relies on Rosetta 2. How long it stays available on Apple Silicon — and on what terms — is an open question, so reducing this dependency is a known long-term concern, not a solved one.
@@ -124,6 +128,7 @@ runtime described by this repository.
 
 - [Orrery](https://tsukasa-art.com/projects/orrery/) — project overview
 - [Orrery Case Notes](https://tsukasa-art.com/projects/orrery/#research-notes-title) — public compatibility investigations with private operational details removed
+- [swingby-dxvk](https://github.com/tsukasa-art/swingby-dxvk) — public DXVK fork with MoltenVK/Apple Silicon compatibility work
 - [melammu-vn](https://github.com/tsukasa-art/melammu-vn) — source-only public reference implementation
 - [Zenn series, part 1](https://zenn.dev/tsukasa_art/articles/mac-eroge-compat-part1) — entry point to the series, not evidence of the current runtime state
 - [Zenn: Wukiyo to Melammu](https://zenn.dev/tsukasa_art/articles/melammu-wukiyo-bridge) — naming transition and series map, not evidence of the current runtime state
