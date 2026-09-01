@@ -234,19 +234,17 @@ static HRESULT WINAPI d3d9_surface_GetDesc(IDirect3DSurface9 *iface, D3DSURFACE_
     return D3D_OK;
 }
 
-/* ---------- Melammu per-slot thumbnail injection ----------
+/* ---------- Legacy Melammu per-slot thumbnail injection ----------
  *
- * CatSystem2 (CMVS64) calls StretchRect(backbuffer → 192×108 RT) then LockRect(0x800)
- * once for EACH visible save slot when the save/load screen renders.  By counting
- * StretchRect events we can determine which slot is being rendered and inject the
- * screenshot that was taken at that slot's save time.
+ * Earlier CMVS experiments counted StretchRect / 192x108 LockRect events and
+ * attempted to map them to visible save slots.  The order was not stable enough,
+ * so this is not the current CMVS save-thumbnail route or source of truth.
  *
  * Communication files. melammu_snap.bgra has multiple writers: Melammu (macOS
  * launcher, SCK-based — see GameCaptureService.swift / LibraryViewModel), plus
- * three wine-side writers (device.c's blt-based capture and last-good-frame
- * paths, and swingby_write_last_good_snap_file below) that raced against the
- * launcher writer and produced black thumbnails; see research/state/thumbnail.md
- * for the resolved design (launcher SCK is now the sole real-pixel source).
+ * Wine-side writers in device.c / surface.c.  The accepted shared d3d9 pair keeps
+ * the Wine-side writer/read path; the launcher SCK single-writer proposal was
+ * rolled back after CMVS regressed to black.  See research/state/thumbnail.md.
  * The per-slot files below are launcher-written only:
  *   /tmp/melammu_snap.bgra          – fallback: most recent screenshot (persistent)
  *   /tmp/melammu_snap_NNN.bgra      – per-slot snap for slot NNN (written at save time)
@@ -1072,9 +1070,10 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
     wined3d_texture_get_sub_resource_desc(surface->wined3d_texture, surface->sub_resource_idx, &desc);
     wined3d_mutex_unlock();
 
-    /* Diag: full-resolution locks are the save-thumbnail readback candidates.
-     * Log them all, and for read-only locks also probe the GPU-side content
-     * through an independent blt so map-vs-GPU divergence is visible. */
+    /* Diag: log full-resolution locks considered during route discovery.  Live
+     * diagnosis identified the implicit back-buffer READONLY lock as the CMVS
+     * route; in observation mode the independent blt still exposes map-vs-GPU
+     * divergence. */
     if (!swingby_rt_capture_active && desc.width >= 640 && desc.height >= 400)
     {
         swingby_diag("LockRect surf=%p %ux%u flags=0x%lx acc=0x%x bind=0x%x rect=%s",
@@ -1085,9 +1084,8 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
     }
 
     /* Retired 2026-06-11: the sysmem-shadow + last-good-fill route is
-     * superseded by the last-presented back-buffer serve below, which
-     * reproduces Windows windowed-present copy semantics exactly.  Kept for
-     * reference until the fix is user-verified. */
+     * superseded by the accepted last-presented back-buffer serve below.
+     * Retained disabled as historical diagnostic code. */
     if (0
             && (flags & D3DLOCK_READONLY)
             && !swingby_rt_capture_active
@@ -1252,11 +1250,10 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                 if (lg2) { fprintf(lg2,"LockRect %ux%u flags=0x%lx acc=0x%x\n",
                     desc.width,desc.height,(unsigned long)flags,desc.access); fclose(lg2); s_lr_throttle=_now; } } }
 
-            /* CMVS locks the full-resolution GetRenderTargetData destination
-             * surface to encode the save thumbnail.  Do not overwrite it from an
-             * external snap here; Windows semantics are established by the direct
-             * render_target -> dst_surface copy in device.c.  This log ties the
-             * LockRect back to the exact GetRenderTargetData destination. */
+            /* Legacy diagnostic correlation for full-resolution
+             * GetRenderTargetData destinations.  This log distinguishes that
+             * activity from the current CMVS save-thumbnail route, which live
+             * diagnosis established as GetBackBuffer + LockRect(READONLY). */
             {
                 DWORD lock_now = GetTickCount();
                 BOOL capture_access = (desc.access == 0xd) || (desc.access == 0xe);
@@ -1294,9 +1291,8 @@ static HRESULT WINAPI d3d9_surface_LockRect(IDirect3DSurface9 *iface,
                 /* The old per-slot preview injection counted 192x108 LockRect calls
                  * and mapped them to save slots.  CMVS does not render slots in a
                  * stable enough order, so reopening the save screen could shift
-                 * thumbnails between slots.  Leave preview surfaces untouched and
-                 * rely on the saved .dat thumbnail produced by the full-resolution
-                 * capture path above. */
+                 * thumbnails between slots.  Leave these preview surfaces untouched;
+                 * the current CMVS capture is the back-buffer READONLY serve above. */
             }
 
             if (desc.width >= 640 && desc.height >= 400 && !swingby_rt_capture_active)
@@ -1369,9 +1365,9 @@ static HRESULT WINAPI d3d9_surface_UnlockRect(IDirect3DSurface9 *iface)
         return hr == WINEDDERR_NOTLOCKED ? D3DERR_INVALIDCALL : hr;
     }
 
-    /* Inject snap AFTER game has written its thumbnail data, before unmap.
-     * .dat persistence is handled exclusively by the Swift side (patchDatFileThumbnail);
-     * this inject is live-preview only. */
+    /* Legacy per-slot preview injection: inject after the game has written its
+     * thumbnail data, before unmap.  This is not the current CMVS capture route;
+     * .dat persistence is handled by the Swift side (patchDatFileThumbnail). */
     if (iface == s_unlock_iface && s_unlock_data != NULL)
     {
         int injected = swingby_inject_snap_slot(s_unlock_data, s_unlock_pitch, s_unlock_slot);

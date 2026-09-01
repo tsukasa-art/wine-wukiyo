@@ -27,18 +27,18 @@ WINE_DEFAULT_DEBUG_CHANNEL(d3d9);
 static void STDMETHODCALLTYPE d3d9_null_wined3d_object_destroyed(void *parent) {}
 
 /* Set by d3d9 hooks whenever a 192x108 save preview surface is touched
- * (save screen open).  Decremented each Present; auto-capture is paused while
- * this is non-zero so /tmp/melammu_snap.bgra keeps the pre-save gameplay frame. */
+ * (save screen open).  Decremented each Present and retained as a legacy
+ * activity marker; it no longer pauses the per-Present last-frame capture. */
 UINT swingby_save_screen_cooldown = 0;
 
 /* Updated whenever /tmp/melammu_snap.bgra is written, regardless of capture path.
- * Surface LockRect injection can use this as a fallback when CMVS reads a
- * capture surface without a fresh GetRenderTargetData snap first. */
+ * Legacy snap-file injection uses this for freshness checks.  The current CMVS
+ * back-buffer READONLY serve does not depend on this timestamp. */
 DWORD melammu_snap_tick = 0;
 
-/* Updated only by the GetRenderTargetData render-target capture path.  Surface
- * LockRect injection prefers this when it is available because it represents
- * the exact RT CMVS is about to encode. */
+/* Updated only by the legacy GetRenderTargetData capture helper.  Retained for
+ * file-based capture bookkeeping; this tick is not evidence for the current
+ * CMVS save-thumbnail route (see research/state/thumbnail.md). */
 DWORD swingby_rt_snap_tick = 0;
 
 /* Set while Melammu's private capture helpers lock their sysmem surfaces. */
@@ -2073,8 +2073,8 @@ static HRESULT WINAPI d3d9_device_GetRenderTargetData(IDirect3DDevice9Ex *iface,
             swingby_on_get_render_target_data(render_target, dst_surface);
 
             if (!swingby_observe_only && !dst_is_192x108)
-                /* Support Melammu's later persistence patch with the same RT pixels.
-                 * The live preview path itself is the direct RT -> dst_surface copy above. */
+                /* Retain the accepted pair's legacy RT-to-snap side path.  Live
+                 * diagnosis did not identify this as the CMVS save-thumbnail route. */
                 swingby_capture_rt_to_snap(iface, device, rt_impl);
         }
         return hr;
@@ -2083,8 +2083,8 @@ static HRESULT WINAPI d3d9_device_GetRenderTargetData(IDirect3DDevice9Ex *iface,
     if (!swingby_capture_is_enabled() || dst_is_cmvs_readback)
         return hr;
 
-    /* Non-CMVS fallback only.  CMVS save thumbnails need Windows semantics:
-     * render_target -> dst_surface, not macOS compositor/front-buffer pixels. */
+    /* Fallback only for destinations not classified as CMVS-associated readback.
+     * The current CMVS route does not pass through GetRenderTargetData. */
     if (device->implicit_swapchain_count > 0)
     {
         wined3d_mutex_lock();
@@ -2251,8 +2251,9 @@ static HRESULT WINAPI d3d9_device_StretchRect(IDirect3DDevice9Ex *iface, IDirect
     /* Melammu: do not write melammu_snap.bgra from 192x108 thumbnail preview
      * StretchRect calls.  These calls render existing save thumbnails in the save
      * UI; treating them as a fresh gameplay capture makes subsequent saves use an
-     * older thumbnail image instead of the scene that was just saved.  Persistence
-     * is handled by GetRenderTargetData -> full-resolution LockRect injection. */
+     * older thumbnail image instead of the scene that was just saved.  The current
+     * CMVS capture route is the per-Present copy served on a back-buffer READONLY
+     * lock, not this preview or GetRenderTargetData activity. */
     if (dst_desc.width == 192 && dst_desc.height == 108)
     {
         swingby_save_screen_cooldown = 1800; /* keep the last gameplay snap while the save screen is open */
@@ -2392,13 +2393,15 @@ static HRESULT WINAPI d3d9_device_CreateOffscreenPlainSurface(IDirect3DDevice9Ex
     }
 }
 
-/* LEGACY (CMVS-only, gated by MELAMMU_CMVS_THUMBS, default-off). Canonical capture =
- * launcher SCK single-writer (research/state/thumbnail.md). Do not extend per-game.
+/* Legacy on-demand helper retained in the accepted CMVS-gated d3d9 pair.  Do not
+ * identify this GetRenderTargetData-side helper as the CMVS save-thumbnail route:
+ * live diagnosis established GetBackBuffer + LockRect(READONLY) instead.  Do not
+ * remove or extend this path without the validation required by
+ * research/state/thumbnail.md.
  *
  * Capture any GPU surface → melammu_snap.bgra via wined3d_device_context_blt.
  * Call WITHOUT holding the wined3d mutex (same calling convention as
- * swingby_capture_frontbuffer).  Used for on-demand thumbnail capture from the
- * exact render target CMVS reads, so we get fresh, HUD-free content. */
+ * swingby_capture_frontbuffer).  Used by the remaining file-based capture paths. */
 static void swingby_capture_rt_to_snap(IDirect3DDevice9Ex *iface,
     struct d3d9_device *device, struct d3d9_surface *src_impl)
 {
@@ -2458,12 +2461,15 @@ static void swingby_capture_rt_to_snap(IDirect3DDevice9Ex *iface,
     IDirect3DSurface9_Release(sys);
 }
 
-/* LEGACY (CMVS-only, gated by MELAMMU_CMVS_THUMBS, default-off). Canonical capture =
- * launcher SCK single-writer (research/state/thumbnail.md). Do not extend per-game.
+/* Current CMVS path, gated by MELAMMU_CMVS_THUMBS and default-off.  The accepted
+ * shared d3d9 pair retains this Wine-side per-Present writer and the READONLY
+ * back-buffer serve in surface.c.  The launcher SCK single-writer proposal was
+ * rolled back after CMVS thumbnails regressed to black; see
+ * research/state/thumbnail.md.  Do not extend this path to other engines.
  *
  * Capture the back buffer to an in-process last-good frame every Present.
  * The disk snap is still rate-limited; the hot path is for CMVS saves where the
- * scene can change immediately before the save menu reads its thumbnail RT. */
+ * scene can change immediately before the save menu reads the back buffer. */
 static void swingby_capture_frontbuffer(IDirect3DDevice9Ex *iface, struct d3d9_device *device)
 {
     static const char snap_trigger[] = "Z:\\tmp\\melammu_take_snap";
