@@ -1,8 +1,8 @@
-# swingby-wine
+# Swingby Wine (`swingby-wine`)
 
 [日本語](README.ja.md)
 
-**swingby-wine** is the public Wine fork used by **Melammu**, the private
+**Swingby Wine** (repository: `swingby-wine`) is the public Wine fork used by **Melammu**, the private
 launcher at the core of [Orrery](https://tsukasa-art.com/projects/orrery/).
 Orrery is a compatibility and library project for running Windows visual
 novels as Mac applications without modifying the games themselves.
@@ -37,7 +37,7 @@ a source-only reference implementation extracted from Melammu. It exposes a
 curated SwiftUI library UI and generic engine detection; it is not the complete
 launcher, a runtime bundle, or a public release of Melammu.
 
-[swingby-dxvk](https://github.com/tsukasa-art/swingby-dxvk) is a sibling public
+**[Swingby DXVK](https://github.com/tsukasa-art/swingby-dxvk)** (repository: `swingby-dxvk`) is a sibling public
 fork, following the same model for a DXVK 2.4.1 base with MoltenVK/Apple
 Silicon compatibility patches.
 
@@ -128,10 +128,10 @@ runtime described by this repository.
 
 - [Orrery](https://tsukasa-art.com/projects/orrery/) — project overview
 - [Orrery Case Notes](https://tsukasa-art.com/projects/orrery/#research-notes-title) — public compatibility investigations with private operational details removed
-- [swingby-dxvk](https://github.com/tsukasa-art/swingby-dxvk) — public DXVK fork with MoltenVK/Apple Silicon compatibility work
+- [Swingby DXVK](https://github.com/tsukasa-art/swingby-dxvk) — public DXVK fork with MoltenVK/Apple Silicon compatibility work
 - [melammu-vn](https://github.com/tsukasa-art/melammu-vn) — source-only public reference implementation
 - [Zenn series, part 1](https://zenn.dev/tsukasa_art/articles/mac-eroge-compat-part1) — entry point to the series, not evidence of the current runtime state
-- [Zenn: Wukiyo to Melammu](https://zenn.dev/tsukasa_art/articles/melammu-wukiyo-bridge) — naming transition and series map, not evidence of the current runtime state
+- [Zenn: Reorganizing Wukiyo as Orrery](https://zenn.dev/tsukasa_art/articles/melammu-wukiyo-bridge) — project reorganization and series map, not evidence of the current runtime state
 - [Sikarugir](https://github.com/Sikarugir-App/Sikarugir) — credited macOS Wine prior art
 
 ---
