@@ -25,12 +25,12 @@
 #include <setjmp.h>
 
 #include "ntstatus.h"
-#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winternl.h"
 #include "ddk/wdm.h"
 #include "wine/exception.h"
 #include "wine/list.h"
+#include "wine/low_va.h"
 #include "ntdll_misc.h"
 #include "unwind.h"
 #include "wine/debug.h"
@@ -53,6 +53,7 @@ static void     (WINAPI *pNotifyMemoryProtect)(void*,SIZE_T,ULONG,BOOL,NTSTATUS)
 static void     (WINAPI *pNotifyUnmapViewOfSection)(void*,BOOL,NTSTATUS);
 static NTSTATUS (WINAPI *pProcessInit)(void);
 static void     (WINAPI *pProcessTerm)(HANDLE,BOOL,NTSTATUS);
+static NTSTATUS (WINAPI *pResyncIdentityMemoryMappingsStatus)(void);
 static void     (WINAPI *pResetToConsistentState)(EXCEPTION_RECORD*,CONTEXT*,ARM64_NT_CONTEXT*);
 static NTSTATUS (WINAPI *pThreadInit)(void);
 static void     (WINAPI *pThreadTerm)(HANDLE,LONG);
@@ -60,11 +61,33 @@ static void     (WINAPI *pUpdateProcessorInformation)(SYSTEM_CPU_INFORMATION*);
 
 static BOOLEAN emulated_processor_features[PROCESSOR_FEATURE_MAX];
 static BYTE KiUserExceptionDispatcher_orig[16]; /* to detect patching */
+static RTL_SRWLOCK deferred_vm_resync_lock = RTL_SRWLOCK_INIT;
+static LONGLONG deferred_vm_sequence;
+static LONGLONG deferred_vm_generation;
+static LONGLONG deferred_vm_resynced_generation;
+static LONG deferred_vm_active;
 extern void KiUserExceptionDispatcher_thunk(void) asm("EXP+#KiUserExceptionDispatcher");
+
+#define MAX_DEFERRED_PROVIDER_SYNC_ATTEMPTS 8
 
 static inline CHPE_V2_CPU_AREA_INFO *get_arm64ec_cpu_area(void)
 {
     return NtCurrentTeb()->ChpeV2CpuAreaInfo;
+}
+
+static BOOL is_exception_stack_frame( ULONG_PTR frame )
+{
+    struct exception_stack_params params = {0};
+    if (frame & (sizeof(void *) - 1)) return FALSE;
+    return !WINE_UNIX_CALL( unix_get_exception_stack, &params ) &&
+           params.limit && frame >= params.limit && frame <= params.base;
+}
+
+static NTSTATUS prepare_shared_stack(void)
+{
+    struct shared_stack_init_params params;
+    params.sp = (ULONG_PTR)&params;
+    return WINE_UNIX_CALL( unix_prepare_shared_stack, &params );
 }
 
 static inline BOOL is_valid_arm64ec_frame( ULONG_PTR frame )
@@ -72,7 +95,7 @@ static inline BOOL is_valid_arm64ec_frame( ULONG_PTR frame )
     if (frame & (sizeof(void*) - 1)) return FALSE;
     if (is_valid_frame( frame )) return TRUE;
     return (frame >= get_arm64ec_cpu_area()->EmulatorStackLimit &&
-            frame <= get_arm64ec_cpu_area()->EmulatorStackBase);
+            frame <= get_arm64ec_cpu_area()->EmulatorStackBase) || is_exception_stack_frame( frame );
 }
 
 static inline BOOL enter_syscall_callback(void)
@@ -82,9 +105,199 @@ static inline BOOL enter_syscall_callback(void)
     return TRUE;
 }
 
+static NTSTATUS drain_deferred_provider_state(void);
+static inline BOOL deferred_provider_sync_done(void);
+
+static inline void finish_syscall_callback(void)
+{
+    CHPE_V2_CPU_AREA_INFO *cpu_area = get_arm64ec_cpu_area();
+    CONTEXT ctx;
+
+    cpu_area->InSyscallCallback = 0;
+
+    if (cpu_area->SuspendDoorbell && *cpu_area->SuspendDoorbell)
+    {
+        RtlCaptureContext( &ctx );
+        if (*cpu_area->SuspendDoorbell) NtContinue( &ctx, FALSE );
+    }
+}
+
 static inline void leave_syscall_callback(void)
 {
-    get_arm64ec_cpu_area()->InSyscallCallback = 0;
+    /* A completed syscall keeps its Windows-visible status.  A failed drain
+     * remains dirty and the mandatory x64 execution gate reports the error. */
+    if (!deferred_provider_sync_done()) drain_deferred_provider_state();
+    finish_syscall_callback();
+}
+
+static inline LONGLONG read_generation64( LONGLONG volatile *generation )
+{
+    return ReadAcquire64( generation );
+}
+
+static inline LONG read_generation( LONG volatile *generation )
+{
+    return ReadAcquire( generation );
+}
+
+static inline BOOL capture_deferred_provider_sync_token( LONGLONG *token_sequence,
+                                                         LONGLONG *token_generation )
+{
+    LONGLONG sequence, generation, resynced, sequence_after;
+    LONG active, active_after;
+    BOOL clean;
+
+    /* Mutators publish active before the first sequence change and clear it
+     * only after the final change.  Matching snapshots cannot splice old
+     * dirty state together with a later quiescent active count. */
+    sequence = read_generation64( &deferred_vm_sequence );
+    generation = read_generation64( &deferred_vm_generation );
+    resynced = read_generation64( &deferred_vm_resynced_generation );
+    active = read_generation( &deferred_vm_active );
+    sequence_after = read_generation64( &deferred_vm_sequence );
+    active_after = read_generation( &deferred_vm_active );
+    clean = sequence == sequence_after && generation == resynced &&
+            !active && !active_after;
+    if (clean && token_sequence) *token_sequence = sequence;
+    if (clean && token_generation) *token_generation = generation;
+    return clean;
+}
+
+static inline BOOL deferred_provider_sync_done(void)
+{
+    return capture_deferred_provider_sync_token( NULL, NULL );
+}
+
+static BOOL acknowledge_single_deferred_provider_mutation( LONGLONG token_sequence,
+                                                            LONGLONG token_generation )
+{
+    LONGLONG sequence, generation, resynced, sequence_after;
+    LONG active, active_after;
+    BOOL ret = FALSE;
+
+    RtlAcquireSRWLockExclusive( &deferred_vm_resync_lock );
+    sequence = read_generation64( &deferred_vm_sequence );
+    generation = read_generation64( &deferred_vm_generation );
+    resynced = read_generation64( &deferred_vm_resynced_generation );
+    active = read_generation( &deferred_vm_active );
+    sequence_after = read_generation64( &deferred_vm_sequence );
+    active_after = read_generation( &deferred_vm_active );
+    if (sequence == sequence_after && !active && !active_after &&
+        (ULONGLONG)sequence - (ULONGLONG)token_sequence == 2 &&
+        (ULONGLONG)generation - (ULONGLONG)token_generation == 1 &&
+        resynced == token_generation)
+    {
+        /* The provider's successful ThreadInit/ThreadTerm directly published
+         * its one transition-stack allocation/free.  A mutation ordered after
+         * this store advances generation again and therefore remains dirty. */
+        InterlockedExchange64( &deferred_vm_resynced_generation, generation );
+        ret = TRUE;
+    }
+    RtlReleaseSRWLockExclusive( &deferred_vm_resync_lock );
+    return ret;
+}
+
+static inline void mark_deferred_provider_resync(void)
+{
+    /* Active brackets the publication so two concurrent completed mutations
+     * cannot expose an apparently stable even sequence between their writes. */
+    InterlockedIncrement( &deferred_vm_active );
+    InterlockedIncrement64( &deferred_vm_sequence );
+    InterlockedIncrement64( &deferred_vm_generation );
+    InterlockedIncrement64( &deferred_vm_sequence );
+    if (!InterlockedDecrement( &deferred_vm_active ))
+        RtlWakeAddressAll( &deferred_vm_active );
+}
+
+static NTSTATUS drain_deferred_provider_state(void)
+{
+    LONGLONG generation;
+    NTSTATUS status = STATUS_SUCCESS;
+    LONG active;
+    ULONG attempt;
+
+    RtlAcquireSRWLockExclusive( &deferred_vm_resync_lock );
+    for (attempt = 0; attempt < MAX_DEFERRED_PROVIDER_SYNC_ATTEMPTS; )
+    {
+        if (deferred_provider_sync_done()) break;
+
+        while ((active = read_generation( &deferred_vm_active )))
+            RtlWaitOnAddress( &deferred_vm_active, &active, sizeof(active), NULL );
+
+        generation = read_generation64( &deferred_vm_generation );
+        if (generation != read_generation64( &deferred_vm_resynced_generation ))
+        {
+            if (!pResyncIdentityMemoryMappingsStatus)
+            {
+                status = STATUS_NOT_SUPPORTED;
+                break;
+            }
+            attempt++;
+            status = pResyncIdentityMemoryMappingsStatus();
+            if (status)
+            {
+                /* Nested VM mutations advance ntdll's deferred generation,
+                 * not necessarily the provider's incremental generation.
+                 * A disappearing view during collection may therefore be
+                 * retryable here even when the provider token is unchanged.
+                 * Do not acknowledge or swallow a stable query failure. */
+                if (status != STATUS_NOT_MAPPED_VIEW && status != STATUS_INVALID_ADDRESS &&
+                    status != STATUS_RETRY) break;
+                while ((active = read_generation( &deferred_vm_active )))
+                    RtlWaitOnAddress( &deferred_vm_active, &active, sizeof(active), NULL );
+                if (read_generation64( &deferred_vm_generation ) == generation) break;
+                WARN( "retry deferred mapping snapshot status %#lx generation %I64d -> %I64d\n",
+                      status, generation, read_generation64( &deferred_vm_generation ) );
+                status = STATUS_RETRY;
+                continue;
+            }
+
+            while ((active = read_generation( &deferred_vm_active )))
+                RtlWaitOnAddress( &deferred_vm_active, &active, sizeof(active), NULL );
+            if (read_generation64( &deferred_vm_generation ) == generation)
+                InterlockedExchange64( &deferred_vm_resynced_generation, generation );
+            continue;
+        }
+        break;
+    }
+    if (!status && !deferred_provider_sync_done()) status = STATUS_RETRY;
+    RtlReleaseSRWLockExclusive( &deferred_vm_resync_lock );
+    return status;
+}
+
+NTSTATUS WINAPI __wine_arm64ec_prepare_x64_execution(void)
+{
+    NTSTATUS status;
+
+    /* This lock-free snapshot is a linearization point, not a promise that no
+     * later mutation can start.  A later nested mutation is drained by its
+     * outermost callback leave; provider map/protect gates pause engines that
+     * are already running while those callbacks publish their state. */
+    if (deferred_provider_sync_done()) return STATUS_SUCCESS;
+    /* A recursive entry cannot safely call back into a live provider
+     * notification.  The outermost leave drains while the flag remains set. */
+    if (!enter_syscall_callback()) return STATUS_RETRY;
+    status = drain_deferred_provider_state();
+    finish_syscall_callback();
+    return status;
+}
+
+static inline BOOL begin_deferred_vm_mutation(void)
+{
+    /* Only current-process mutations affect this provider's identity lane.
+     * Remote mutations retain the bounded cross-process work-list contract. */
+    InterlockedIncrement( &deferred_vm_active );
+    InterlockedIncrement64( &deferred_vm_sequence );
+    return TRUE;
+}
+
+static inline void end_deferred_vm_mutation( BOOL deferred, NTSTATUS status )
+{
+    if (!deferred) return;
+    if (NT_SUCCESS(status)) InterlockedIncrement64( &deferred_vm_generation );
+    InterlockedIncrement64( &deferred_vm_sequence );
+    if (!InterlockedDecrement( &deferred_vm_active ))
+        RtlWakeAddressAll( &deferred_vm_active );
 }
 
 /**********************************************************************
@@ -157,17 +370,20 @@ static BOOL send_cross_process_notification( HANDLE process, UINT id, const void
 
 static void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64EC_METADATA *metadata )
 {
-    const IMAGE_ARM64EC_REDIRECTION_ENTRY *map = get_rva( module, metadata->RedirectionMetadata );
-    int min = 0, max = metadata->RedirectionMetadataCount - 1;
+    const char *map = get_rva( module, metadata->RedirectionMetadata );
+    ULONG min = 0, max = metadata->RedirectionMetadataCount;
     ULONG_PTR rva = (ULONG_PTR)ptr - (ULONG_PTR)module;
 
     if (!ptr) return NULL;
-    while (min <= max)
+    while (min < max)
     {
-        int pos = (min + max) / 2;
-        if (map[pos].Source == rva) return get_rva( module, map[pos].Destination );
-        if (map[pos].Source < rva) min = pos + 1;
-        else max = pos - 1;
+        IMAGE_ARM64EC_REDIRECTION_ENTRY entry;
+        ULONG pos = min + (max - min) / 2;
+
+        memcpy( &entry, map + pos * sizeof(entry), sizeof(entry) );
+        if (entry.Source == rva) return get_rva( module, entry.Destination );
+        if (entry.Source < rva) min = pos + 1;
+        else max = pos;
     }
     return ptr;
 }
@@ -179,9 +395,12 @@ static void arm64x_check_call(void);
  */
 NTSTATUS arm64ec_process_init( HMODULE module )
 {
-    NTSTATUS status = STATUS_SUCCESS;
+    NTSTATUS status = STATUS_SUCCESS, sync_status;
     CHPEV2_PROCESS_INFO *info = (CHPEV2_PROCESS_INFO *)(RtlGetCurrentPeb() + 1);
     const IMAGE_ARM64EC_METADATA *metadata = arm64ec_get_module_metadata( module );
+    LONGLONG token_sequence = 0, token_generation = 0;
+    BOOL thread_token = FALSE;
+    void *thread_state = NULL;
 
     __os_arm64x_dispatch_call_no_redirect = RtlFindExportedRoutineByName( module, "ExitToX64" );
     __os_arm64x_dispatch_fptr = RtlFindExportedRoutineByName( module, "DispatchJump" );
@@ -202,6 +421,7 @@ NTSTATUS arm64ec_process_init( HMODULE module )
     GET_PTR( NotifyUnmapViewOfSection );
     GET_PTR( ProcessInit );
     GET_PTR( ProcessTerm );
+    GET_PTR( ResyncIdentityMemoryMappingsStatus );
     GET_PTR( ResetToConsistentState );
     GET_PTR( ThreadInit );
     GET_PTR( ThreadTerm );
@@ -221,8 +441,21 @@ NTSTATUS arm64ec_process_init( HMODULE module )
             emulated_processor_features[i] = pBTCpu64IsProcessorFeaturePresent( i );
         status = create_cross_process_work_list( info );
     }
-    if (!status && pThreadInit) status = pThreadInit();
-    leave_syscall_callback();
+    if (!status && pThreadInit)
+    {
+        thread_state = get_arm64ec_cpu_area()->EmulatorData[0];
+        thread_token = capture_deferred_provider_sync_token( &token_sequence,
+                                                              &token_generation );
+        status = pThreadInit();
+        if (!status && thread_token && !thread_state &&
+            get_arm64ec_cpu_area()->EmulatorData[0])
+            acknowledge_single_deferred_provider_mutation( token_sequence,
+                                                            token_generation );
+    }
+    sync_status = drain_deferred_provider_state();
+    finish_syscall_callback();
+    if (!status) status = sync_status;
+    if (!status) status = prepare_shared_stack();
     __os_arm64x_check_call = arm64x_check_call;
     __os_arm64x_check_icall = arm64x_check_call;
     __os_arm64x_check_icall_cfg = arm64x_check_call;
@@ -235,11 +468,27 @@ NTSTATUS arm64ec_process_init( HMODULE module )
  */
 NTSTATUS arm64ec_thread_init(void)
 {
-    NTSTATUS status = STATUS_SUCCESS;
+    NTSTATUS status = STATUS_SUCCESS, sync_status;
+    LONGLONG token_sequence = 0, token_generation = 0;
+    BOOL thread_token;
+    void *thread_state;
 
     enter_syscall_callback();
-    if (pThreadInit) status = pThreadInit();
-    leave_syscall_callback();
+    thread_state = get_arm64ec_cpu_area()->EmulatorData[0];
+    thread_token = capture_deferred_provider_sync_token( &token_sequence,
+                                                          &token_generation );
+    if (pThreadInit)
+    {
+        status = pThreadInit();
+        if (!status && thread_token && !thread_state &&
+            get_arm64ec_cpu_area()->EmulatorData[0])
+            acknowledge_single_deferred_provider_mutation( token_sequence,
+                                                            token_generation );
+    }
+    sync_status = drain_deferred_provider_state();
+    finish_syscall_callback();
+    if (!status) status = sync_status;
+    if (!status) status = prepare_shared_stack();
     return status;
 }
 
@@ -249,28 +498,38 @@ NTSTATUS arm64ec_thread_init(void)
  */
 IMAGE_ARM64EC_METADATA *arm64ec_get_module_metadata( HMODULE module )
 {
-    IMAGE_LOAD_CONFIG_DIRECTORY *cfg;
-    ULONG size;
+    char *cfg;
+    ULONGLONG metadata;
+    ULONG declared_size, size;
 
     if (!(cfg = RtlImageDirectoryEntryToData( module, TRUE,
                                               IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &size )))
         return NULL;
 
-    size = min( size, cfg->Size );
-    if (size <= offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, CHPEMetadataPointer )) return NULL;
-    return (IMAGE_ARM64EC_METADATA *)cfg->CHPEMetadataPointer;
+    if (size < sizeof(declared_size)) return NULL;
+    memcpy( &declared_size, cfg, sizeof(declared_size) );
+    size = min( size, declared_size );
+    if (size < offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, CHPEMetadataPointer ) +
+               sizeof(metadata)) return NULL;
+    memcpy( &metadata, cfg + offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, CHPEMetadataPointer ),
+            sizeof(metadata) );
+    return (IMAGE_ARM64EC_METADATA *)(ULONG_PTR)metadata;
 }
 
 
 static void update_hybrid_pointer( void *module, const IMAGE_SECTION_HEADER *sec, UINT rva, void *ptr )
 {
+    SIZE_T offset;
+
     if (!rva) return;
 
-    if (rva < sec->VirtualAddress || rva >= sec->VirtualAddress + sec->Misc.VirtualSize)
+    if (rva < sec->VirtualAddress ||
+        (offset = rva - sec->VirtualAddress) > sec->Misc.VirtualSize ||
+        sizeof(void *) > sec->Misc.VirtualSize - offset)
         ERR( "rva %x outside of section %s (%lx-%lx)\n", rva,
              sec->Name, sec->VirtualAddress, sec->VirtualAddress + sec->Misc.VirtualSize );
     else
-        *(void **)get_rva( module, rva ) = ptr;
+        memcpy( get_rva( module, rva ), &ptr, sizeof(ptr) );
 }
 
 /*******************************************************************
@@ -279,6 +538,7 @@ static void update_hybrid_pointer( void *module, const IMAGE_SECTION_HEADER *sec
 void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
                                      const IMAGE_ARM64EC_METADATA *metadata )
 {
+    NTSTATUS status;
     DWORD i, protect_old;
     const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION( nt );
 
@@ -286,13 +546,19 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
 
     for (i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
     {
-        if ((sec->VirtualAddress <= metadata->__os_arm64x_dispatch_call) &&
-            (sec->VirtualAddress + sec->Misc.VirtualSize > metadata->__os_arm64x_dispatch_call))
+        if (metadata->__os_arm64x_dispatch_call >= sec->VirtualAddress &&
+            metadata->__os_arm64x_dispatch_call - sec->VirtualAddress < sec->Misc.VirtualSize)
         {
             void *base = get_rva( module, sec->VirtualAddress );
             SIZE_T size = sec->Misc.VirtualSize;
 
-            NtProtectVirtualMemory( NtCurrentProcess(), &base, &size, PAGE_READWRITE, &protect_old );
+            status = NtProtectVirtualMemory( NtCurrentProcess(), &base, &size,
+                                             PAGE_READWRITE, &protect_old );
+            if (status)
+            {
+                ERR( "failed to make hybrid metadata writable, status %08lx\n", status );
+                return;
+            }
 
 #define SET_FUNC(func,val) update_hybrid_pointer( module, sec, metadata->func, val )
             SET_FUNC( __os_arm64x_dispatch_call, arm64x_check_call );
@@ -311,7 +577,10 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
             SET_FUNC( SetX64InformationFunctionPointer, __os_arm64x_set_x64_information );
 #undef SET_FUNC
 
-            NtProtectVirtualMemory( NtCurrentProcess(), &base, &size, protect_old, &protect_old );
+            status = NtProtectVirtualMemory( NtCurrentProcess(), &base, &size,
+                                             protect_old, &protect_old );
+            if (status)
+                ERR( "failed to restore hybrid metadata protection, status %08lx\n", status );
             return;
         }
     }
@@ -325,10 +594,23 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
 enum syscall_ids
 {
 #define SYSCALL_ENTRY(id,name,args) __id_##name = id,
-ALL_SYSCALLS64
+    ALL_SYSCALLS
 #undef SYSCALL_ENTRY
     __nb_syscalls
 };
+
+/* Keep the provider's direct-syscall discriminator synchronized with the
+ * generated service table without coupling ntdll to xtajit64's private ABI. */
+C_ASSERT( __id_NtReadVirtualMemory == 0x003f );
+
+NTSTATUS WINAPI __wine_arm64ec_get_x64_syscall_dispatcher( ULONG_PTR *dispatcher,
+                                                            ULONG *count )
+{
+    if (!dispatcher || !count) return STATUS_INVALID_PARAMETER;
+    *dispatcher = (ULONG_PTR)invoke_arm64ec_syscall;
+    *count = __nb_syscalls;
+    return STATUS_SUCCESS;
+}
 
 #define DEFINE_SYSCALL_(ret,name,args) \
     ret __attribute__((naked, hybrid_patchable)) name args { __ASM_SYSCALL_FUNC( __id_##name, name ); }
@@ -342,10 +624,12 @@ ALL_SYSCALLS64
 
 DEFINE_SYSCALL(NtAcceptConnectPort, (HANDLE *handle, ULONG id, LPC_MESSAGE *msg, BOOLEAN accept, LPC_SECTION_WRITE *write, LPC_SECTION_READ *read))
 DEFINE_SYSCALL(NtAccessCheck, (PSECURITY_DESCRIPTOR descr, HANDLE token, ACCESS_MASK access, GENERIC_MAPPING *mapping, PRIVILEGE_SET *privs, ULONG *retlen, ULONG *access_granted, NTSTATUS *access_status))
-DEFINE_SYSCALL(NtAccessCheckAndAuditAlarm, (UNICODE_STRING *subsystem, HANDLE handle, UNICODE_STRING *typename, UNICODE_STRING *objectname, PSECURITY_DESCRIPTOR descr, ACCESS_MASK access, GENERIC_MAPPING *mapping, BOOLEAN creation, ACCESS_MASK *access_granted, BOOLEAN *access_status, BOOLEAN *onclose))
+DEFINE_SYSCALL(NtAccessCheckAndAuditAlarm, (UNICODE_STRING *subsystem, HANDLE handle, UNICODE_STRING *typename, UNICODE_STRING *objectname, PSECURITY_DESCRIPTOR descr, ACCESS_MASK access, GENERIC_MAPPING *mapping, BOOLEAN creation, ACCESS_MASK *access_granted, NTSTATUS *access_status, BOOLEAN *onclose))
+DEFINE_SYSCALL(NtAccessCheckByTypeAndAuditAlarm, (UNICODE_STRING *subsystem, HANDLE handle, UNICODE_STRING *typename, UNICODE_STRING *objectname, PSECURITY_DESCRIPTOR descr, PSID sid, ACCESS_MASK access, AUDIT_EVENT_TYPE audit_type, ULONG flags, OBJECT_TYPE_LIST *obj_list, ULONG list_len, GENERIC_MAPPING *mapping, BOOLEAN creation, ACCESS_MASK *access_granted, NTSTATUS *access_status, BOOLEAN *onclose))
 DEFINE_SYSCALL(NtAddAtom, (const WCHAR *name, ULONG length, RTL_ATOM *atom))
 DEFINE_SYSCALL(NtAdjustGroupsToken, (HANDLE token, BOOLEAN reset, TOKEN_GROUPS *groups, ULONG length, TOKEN_GROUPS *prev, ULONG *retlen))
 DEFINE_SYSCALL(NtAdjustPrivilegesToken, (HANDLE token, BOOLEAN disable, TOKEN_PRIVILEGES *privs, DWORD length, TOKEN_PRIVILEGES *prev, DWORD *retlen))
+DEFINE_SYSCALL(NtAlertMultipleThreadByThreadId, (HANDLE *tids, ULONG count, void *unk1, void *unk2))
 DEFINE_SYSCALL(NtAlertResumeThread, (HANDLE handle, ULONG *count))
 DEFINE_SYSCALL(NtAlertThread, (HANDLE handle))
 DEFINE_SYSCALL(NtAlertThreadByThreadId, (HANDLE tid))
@@ -354,6 +638,13 @@ DEFINE_SYSCALL(NtAllocateReserveObject, (HANDLE *handle, const OBJECT_ATTRIBUTES
 DEFINE_SYSCALL(NtAllocateUuids, (ULARGE_INTEGER *time, ULONG *delta, ULONG *sequence, UCHAR *seed))
 DEFINE_WRAPPED_SYSCALL(NtAllocateVirtualMemory, (HANDLE process, PVOID *ret, ULONG_PTR zero_bits, SIZE_T *size_ptr, ULONG type, ULONG protect))
 DEFINE_WRAPPED_SYSCALL(NtAllocateVirtualMemoryEx, (HANDLE process, PVOID *ret, SIZE_T *size_ptr, ULONG type, ULONG protect, MEM_EXTENDED_PARAMETER *parameters, ULONG count))
+DEFINE_SYSCALL(NtAlpcAcceptConnectPort, (HANDLE *communication_port, HANDLE connection_port, DWORD flags, OBJECT_ATTRIBUTES *obj_attr, ALPC_PORT_ATTRIBUTES *port_attr, void *port_context, ALPC_PORT_MESSAGE *send_msg, ALPC_MESSAGE_ATTRIBUTES *send_msg_attr, BOOLEAN accept))
+DEFINE_SYSCALL(NtAlpcConnectPort, (HANDLE *port_handle, UNICODE_STRING *port_name, OBJECT_ATTRIBUTES *obj_attr, ALPC_PORT_ATTRIBUTES *port_attr, DWORD flags, PSID required_server_sid, ALPC_PORT_MESSAGE *connect_msg, SIZE_T *connect_msg_size, ALPC_MESSAGE_ATTRIBUTES *send_msg_attr, ALPC_MESSAGE_ATTRIBUTES *recv_msg_attr, LARGE_INTEGER *timeout))
+DEFINE_SYSCALL(NtAlpcCreatePort, (HANDLE *port_handle, OBJECT_ATTRIBUTES *obj_attr, ALPC_PORT_ATTRIBUTES *port_attr))
+DEFINE_SYSCALL(NtAlpcDisconnectPort, (HANDLE port_handle, ULONG flags))
+DEFINE_SYSCALL(NtAlpcImpersonateClientOfPort, (HANDLE port_handle, ALPC_PORT_MESSAGE *msg, void *reserved ))
+DEFINE_SYSCALL(NtAlpcSendWaitReceivePort, (HANDLE port_handle, DWORD flags, ALPC_PORT_MESSAGE *send_msg, ALPC_MESSAGE_ATTRIBUTES *send_msg_attr, ALPC_PORT_MESSAGE *recv_msg, SIZE_T *recv_buffer_size, ALPC_MESSAGE_ATTRIBUTES *recv_msg_attr, LARGE_INTEGER *timeout))
+DEFINE_SYSCALL(NtApphelpCacheControl, (ULONG class, void *context))
 DEFINE_SYSCALL(NtAreMappedFilesTheSame, (PVOID addr1, PVOID addr2))
 DEFINE_SYSCALL(NtAssignProcessToJobObject, (HANDLE job, HANDLE process))
 DEFINE_SYSCALL(NtCallbackReturn, (void *ret_ptr, ULONG ret_len, NTSTATUS status))
@@ -363,6 +654,7 @@ DEFINE_SYSCALL(NtCancelSynchronousIoFile, (HANDLE handle, IO_STATUS_BLOCK *io, I
 DEFINE_SYSCALL(NtCancelTimer, (HANDLE handle, BOOLEAN *state))
 DEFINE_SYSCALL(NtClearEvent, (HANDLE handle))
 DEFINE_SYSCALL(NtClose, (HANDLE handle))
+DEFINE_SYSCALL(NtCloseObjectAuditAlarm, (UNICODE_STRING *subsystem, HANDLE handle, BOOLEAN onclose))
 DEFINE_SYSCALL(NtCommitTransaction, (HANDLE transaction, BOOLEAN wait))
 DEFINE_SYSCALL(NtCompareObjects, (HANDLE first, HANDLE second))
 DEFINE_SYSCALL(NtCompareTokens, (HANDLE first, HANDLE second, BOOLEAN *equal))
@@ -370,6 +662,7 @@ DEFINE_SYSCALL(NtCompleteConnectPort, (HANDLE handle))
 DEFINE_SYSCALL(NtConnectPort, (HANDLE *handle, UNICODE_STRING *name, SECURITY_QUALITY_OF_SERVICE *qos, LPC_SECTION_WRITE *write, LPC_SECTION_READ *read, ULONG *max_len, void *info, ULONG *info_len))
 DEFINE_WRAPPED_SYSCALL(NtContinue, (ARM64_NT_CONTEXT *context, BOOLEAN alertable))
 DEFINE_WRAPPED_SYSCALL(NtContinueEx, (ARM64_NT_CONTEXT *context, KCONTINUE_ARGUMENT *args))
+DEFINE_SYSCALL(NtConvertBetweenAuxiliaryCounterAndPerformanceCounter, (ULONG flag, ULONGLONG *from, ULONGLONG *to, ULONGLONG *error))
 DEFINE_SYSCALL(NtCreateDebugObject, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, ULONG flags))
 DEFINE_SYSCALL(NtCreateDirectoryObject, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr))
 DEFINE_SYSCALL(NtCreateEvent, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, EVENT_TYPE type, BOOLEAN state))
@@ -385,7 +678,9 @@ DEFINE_SYSCALL(NtCreateMutant, (HANDLE *handle, ACCESS_MASK access, const OBJECT
 DEFINE_SYSCALL(NtCreateNamedPipeFile, (HANDLE *handle, ULONG access, OBJECT_ATTRIBUTES *attr, IO_STATUS_BLOCK *io, ULONG sharing, ULONG dispo, ULONG options, ULONG pipe_type, ULONG read_mode, ULONG completion_mode, ULONG max_inst, ULONG inbound_quota, ULONG outbound_quota, LARGE_INTEGER *timeout))
 DEFINE_SYSCALL(NtCreatePagingFile, (UNICODE_STRING *name, LARGE_INTEGER *min_size, LARGE_INTEGER *max_size, LARGE_INTEGER *actual_size))
 DEFINE_SYSCALL(NtCreatePort, (HANDLE *handle, OBJECT_ATTRIBUTES *attr, ULONG info_len, ULONG data_len, ULONG *reserved))
+DEFINE_SYSCALL(NtCreateProcessEx, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, HANDLE parent, ULONG flags, HANDLE section, HANDLE debug, HANDLE token, ULONG reserved))
 DEFINE_SYSCALL(NtCreateSection, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, const LARGE_INTEGER *size, ULONG protect, ULONG sec_flags, HANDLE file))
+DEFINE_SYSCALL(NtCreateSectionEx, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, const LARGE_INTEGER *size, ULONG protect, ULONG sec_flags, HANDLE file, MEM_EXTENDED_PARAMETER *parameters, ULONG count))
 DEFINE_SYSCALL(NtCreateSemaphore, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, LONG initial, LONG max))
 DEFINE_SYSCALL(NtCreateSymbolicLinkObject, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, UNICODE_STRING *target))
 DEFINE_SYSCALL(NtCreateThread, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, HANDLE process, CLIENT_ID *id, CONTEXT *ctx, INITIAL_TEB *teb, BOOLEAN suspended))
@@ -414,15 +709,17 @@ DEFINE_SYSCALL(NtFlushBuffersFileEx, (HANDLE handle, ULONG flags, void *params, 
 DEFINE_WRAPPED_SYSCALL(NtFlushInstructionCache, (HANDLE handle, const void *addr, SIZE_T size))
 DEFINE_SYSCALL(NtFlushKey, (HANDLE key))
 DEFINE_SYSCALL(NtFlushProcessWriteBuffers, (void))
-DEFINE_SYSCALL(NtFlushVirtualMemory, (HANDLE process, LPCVOID *addr_ptr, SIZE_T *size_ptr, ULONG unknown))
+DEFINE_SYSCALL(NtFlushVirtualMemory, (HANDLE process, LPCVOID *addr_ptr, SIZE_T *size_ptr, IO_STATUS_BLOCK *io))
 DEFINE_WRAPPED_SYSCALL(NtFreeVirtualMemory, (HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr, ULONG type))
 DEFINE_SYSCALL(NtFsControlFile, (HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_context, IO_STATUS_BLOCK *io, ULONG code, void *in_buffer, ULONG in_size, void *out_buffer, ULONG out_size))
 DEFINE_WRAPPED_SYSCALL(NtGetContextThread, (HANDLE handle, ARM64_NT_CONTEXT *context))
 DEFINE_SYSCALL_(ULONG, NtGetCurrentProcessorNumber, (void))
+DEFINE_SYSCALL(NtGetNextProcess, (HANDLE process, ACCESS_MASK access, ULONG attributes, ULONG flags, HANDLE *handle))
 DEFINE_SYSCALL(NtGetNextThread, (HANDLE process, HANDLE thread, ACCESS_MASK access, ULONG attributes, ULONG flags, HANDLE *handle))
 DEFINE_SYSCALL(NtGetNlsSectionPtr, (ULONG type, ULONG id, void *unknown, void **ptr, SIZE_T *size))
 DEFINE_SYSCALL(NtGetWriteWatch, (HANDLE process, ULONG flags, PVOID base, SIZE_T size, PVOID *addresses, ULONG_PTR *count, ULONG *granularity))
 DEFINE_SYSCALL(NtImpersonateAnonymousToken, (HANDLE thread))
+DEFINE_SYSCALL(NtImpersonateClientOfPort, (HANDLE handle, LPC_MESSAGE *request))
 DEFINE_SYSCALL(NtInitializeNlsFiles, (void **ptr, LCID *lcid, LARGE_INTEGER *size))
 DEFINE_SYSCALL(NtInitiatePowerAction, (POWER_ACTION action, SYSTEM_POWER_STATE state, ULONG flags, BOOLEAN async))
 DEFINE_SYSCALL(NtIsProcessInJob, (HANDLE process, HANDLE job))
@@ -435,6 +732,7 @@ DEFINE_SYSCALL(NtLockFile, (HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void
 DEFINE_SYSCALL(NtLockVirtualMemory, (HANDLE process, PVOID *addr, SIZE_T *size, ULONG unknown))
 DEFINE_SYSCALL(NtMakePermanentObject, (HANDLE handle))
 DEFINE_SYSCALL(NtMakeTemporaryObject, (HANDLE handle))
+DEFINE_SYSCALL(NtMapUserPhysicalPagesScatter, (void **addr, SIZE_T count, ULONG_PTR *pages))
 DEFINE_WRAPPED_SYSCALL(NtMapViewOfSection, (HANDLE handle, HANDLE process, PVOID *addr_ptr, ULONG_PTR zero_bits, SIZE_T commit_size, const LARGE_INTEGER *offset_ptr, SIZE_T *size_ptr, SECTION_INHERIT inherit, ULONG alloc_type, ULONG protect))
 DEFINE_WRAPPED_SYSCALL(NtMapViewOfSectionEx, (HANDLE handle, HANDLE process, PVOID *addr_ptr, const LARGE_INTEGER *offset_ptr, SIZE_T *size_ptr, ULONG alloc_type, ULONG protect, MEM_EXTENDED_PARAMETER *parameters, ULONG count))
 DEFINE_SYSCALL(NtNotifyChangeDirectoryFile, (HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_context, IO_STATUS_BLOCK *iosb, void *buffer, ULONG buffer_size, ULONG filter, BOOLEAN subtree))
@@ -503,10 +801,12 @@ DEFINE_SYSCALL(NtQueryVirtualMemory, (HANDLE process, LPCVOID addr, MEMORY_INFOR
 DEFINE_SYSCALL(NtQueryVolumeInformationFile, (HANDLE handle, IO_STATUS_BLOCK *io, void *buffer, ULONG length, FS_INFORMATION_CLASS info_class))
 DEFINE_SYSCALL(NtQueueApcThread, (HANDLE handle, PNTAPCFUNC func, ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3))
 DEFINE_SYSCALL(NtQueueApcThreadEx, (HANDLE handle, HANDLE reserve_handle, PNTAPCFUNC func, ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3))
+DEFINE_SYSCALL(NtQueueApcThreadEx2, (HANDLE handle, HANDLE reserve_handle, ULONG flags, PNTAPCFUNC func, ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3))
 DEFINE_WRAPPED_SYSCALL(NtRaiseException, (EXCEPTION_RECORD *rec, ARM64_NT_CONTEXT *context, BOOL first_chance))
 DEFINE_SYSCALL(NtRaiseHardError, (NTSTATUS status, ULONG count, ULONG params_mask, void **params, HARDERROR_RESPONSE_OPTION option, HARDERROR_RESPONSE *response))
 DEFINE_WRAPPED_SYSCALL(NtReadFile, (HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, void *buffer, ULONG length, LARGE_INTEGER *offset, ULONG *key))
 DEFINE_SYSCALL(NtReadFileScatter, (HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, FILE_SEGMENT_ELEMENT *segments, ULONG length, LARGE_INTEGER *offset, ULONG *key))
+DEFINE_SYSCALL(NtReadRequestData, (HANDLE handle, LPC_MESSAGE *request, ULONG id, void *buffer, ULONG len, ULONG *retlen))
 DEFINE_SYSCALL(NtReadVirtualMemory, (HANDLE process, const void *addr, void *buffer, SIZE_T size, SIZE_T *bytes_read))
 DEFINE_SYSCALL(NtRegisterThreadTerminatePort, (HANDLE handle))
 DEFINE_SYSCALL(NtReleaseKeyedEvent, (HANDLE handle, const void *key, BOOLEAN alertable, const LARGE_INTEGER *timeout))
@@ -517,7 +817,9 @@ DEFINE_SYSCALL(NtRemoveIoCompletionEx, (HANDLE handle, FILE_IO_COMPLETION_INFORM
 DEFINE_SYSCALL(NtRemoveProcessDebug, (HANDLE process, HANDLE debug))
 DEFINE_SYSCALL(NtRenameKey, (HANDLE key, UNICODE_STRING *name))
 DEFINE_SYSCALL(NtReplaceKey, (OBJECT_ATTRIBUTES *attr, HANDLE key, OBJECT_ATTRIBUTES *replace))
+DEFINE_SYSCALL(NtReplyPort, (HANDLE handle, LPC_MESSAGE *reply))
 DEFINE_SYSCALL(NtReplyWaitReceivePort, (HANDLE handle, ULONG *id, LPC_MESSAGE *reply, LPC_MESSAGE *msg))
+DEFINE_SYSCALL(NtReplyWaitReceivePortEx, (HANDLE handle, ULONG *id, LPC_MESSAGE *reply, LPC_MESSAGE *msg, LARGE_INTEGER *timeout))
 DEFINE_SYSCALL(NtRequestWaitReplyPort, (HANDLE handle, LPC_MESSAGE *msg_in, LPC_MESSAGE *msg_out))
 DEFINE_SYSCALL(NtResetEvent, (HANDLE handle, LONG *prev_state))
 DEFINE_SYSCALL(NtResetWriteWatch, (HANDLE process, PVOID base, SIZE_T size))
@@ -533,6 +835,7 @@ DEFINE_SYSCALL(NtSetDefaultLocale, (BOOLEAN user, LCID lcid))
 DEFINE_SYSCALL(NtSetDefaultUILanguage, (LANGID lang))
 DEFINE_SYSCALL(NtSetEaFile, (HANDLE handle, IO_STATUS_BLOCK *io, void *buffer, ULONG length))
 DEFINE_SYSCALL(NtSetEvent, (HANDLE handle, LONG *prev_state))
+DEFINE_SYSCALL(NtSetEventBoostPriority, (HANDLE handle))
 DEFINE_SYSCALL(NtSetInformationDebugObject, (HANDLE handle, DEBUGOBJECTINFOCLASS class, void *info, ULONG len, ULONG *ret_len))
 DEFINE_SYSCALL(NtSetInformationFile, (HANDLE handle, IO_STATUS_BLOCK *io, void *ptr, ULONG len, FILE_INFORMATION_CLASS class))
 DEFINE_SYSCALL(NtSetInformationJobObject, (HANDLE handle, JOBOBJECTINFOCLASS class, void *info, ULONG len))
@@ -545,7 +848,7 @@ DEFINE_SYSCALL(NtSetInformationVirtualMemory, (HANDLE process, VIRTUAL_MEMORY_IN
 DEFINE_SYSCALL(NtSetIntervalProfile, (ULONG interval, KPROFILE_SOURCE source))
 DEFINE_SYSCALL(NtSetIoCompletion, (HANDLE handle, ULONG_PTR key, ULONG_PTR value, NTSTATUS status, SIZE_T count))
 DEFINE_SYSCALL(NtSetIoCompletionEx, (HANDLE completion_handle, HANDLE completion_reserve_handle, ULONG_PTR key, ULONG_PTR value, NTSTATUS status, SIZE_T count))
-DEFINE_SYSCALL(NtSetLdtEntries, (ULONG sel1, LDT_ENTRY entry1, ULONG sel2, LDT_ENTRY entry2))
+DEFINE_SYSCALL(NtSetLdtEntries, (ULONG sel1, ULONG entry1_low, ULONG entry1_high, ULONG sel2, ULONG entry2_low, ULONG entry2_high))
 DEFINE_SYSCALL(NtSetSecurityObject, (HANDLE handle, SECURITY_INFORMATION info, PSECURITY_DESCRIPTOR descr))
 DEFINE_SYSCALL(NtSetSystemInformation, (SYSTEM_INFORMATION_CLASS class, void *info, ULONG length))
 DEFINE_SYSCALL(NtSetSystemTime, (const LARGE_INTEGER *new, LARGE_INTEGER *old))
@@ -564,6 +867,7 @@ DEFINE_WRAPPED_SYSCALL(NtTerminateProcess, (HANDLE handle, LONG exit_code))
 DEFINE_WRAPPED_SYSCALL(NtTerminateThread, (HANDLE handle, LONG exit_code))
 DEFINE_SYSCALL(NtTestAlert, (void))
 DEFINE_SYSCALL(NtTraceControl, (ULONG code, void *inbuf, ULONG inbuf_len, void *outbuf, ULONG outbuf_len, ULONG *size))
+DEFINE_SYSCALL(NtTraceEvent, (HANDLE handle, ULONG flags, ULONG size, void *data))
 DEFINE_SYSCALL(NtUnloadDriver, (const UNICODE_STRING *name))
 DEFINE_SYSCALL(NtUnloadKey, (OBJECT_ATTRIBUTES *attr))
 DEFINE_SYSCALL(NtUnlockFile, (HANDLE handle, IO_STATUS_BLOCK *io_status, LARGE_INTEGER *offset, LARGE_INTEGER *count, ULONG *key))
@@ -573,23 +877,30 @@ DEFINE_WRAPPED_SYSCALL(NtUnmapViewOfSectionEx, (HANDLE process, PVOID addr, ULON
 DEFINE_SYSCALL(NtWaitForAlertByThreadId, (const void *address, const LARGE_INTEGER *timeout))
 DEFINE_SYSCALL(NtWaitForDebugEvent, (HANDLE handle, BOOLEAN alertable, LARGE_INTEGER *timeout, DBGUI_WAIT_STATE_CHANGE *state))
 DEFINE_SYSCALL(NtWaitForKeyedEvent, (HANDLE handle, const void *key, BOOLEAN alertable, const LARGE_INTEGER *timeout))
-DEFINE_SYSCALL(NtWaitForMultipleObjects, (DWORD count, const HANDLE *handles, BOOLEAN wait_any, BOOLEAN alertable, const LARGE_INTEGER *timeout))
+DEFINE_SYSCALL(NtWaitForMultipleObjects, (DWORD count, const HANDLE *handles, WAIT_TYPE type, BOOLEAN alertable, const LARGE_INTEGER *timeout))
+DEFINE_SYSCALL(NtWaitForMultipleObjects32, (ULONG count, LONG *handles, WAIT_TYPE type, BOOLEAN alertable, const LARGE_INTEGER *timeout))
 DEFINE_SYSCALL(NtWaitForSingleObject, (HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout))
+DEFINE_SYSCALL(NtWorkerFactoryWorkerReady, (HANDLE handle))
 DEFINE_SYSCALL(NtWriteFile, (HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, const void *buffer, ULONG length, LARGE_INTEGER *offset, ULONG *key))
 DEFINE_SYSCALL(NtWriteFileGather, (HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, FILE_SEGMENT_ELEMENT *segments, ULONG length, LARGE_INTEGER *offset, ULONG *key))
+DEFINE_SYSCALL(NtWriteRequestData, (HANDLE handle, LPC_MESSAGE *request, ULONG id, void *buffer, ULONG len, ULONG *retlen))
 DEFINE_SYSCALL(NtWriteVirtualMemory, (HANDLE process, void *addr, const void *buffer, SIZE_T size, SIZE_T *bytes_written))
 DEFINE_SYSCALL(NtYieldExecution, (void))
-DEFINE_SYSCALL(wine_nt_to_unix_file_name, (const OBJECT_ATTRIBUTES *attr, char *nameA, ULONG *size, UINT disposition))
-DEFINE_SYSCALL(wine_unix_to_nt_file_name, (const char *name, WCHAR *buffer, ULONG *size))
 
 NTSTATUS SYSCALL_API NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR zero_bits,
                                               SIZE_T *size_ptr, ULONG type, ULONG protect )
 {
     BOOL is_current = RtlIsCurrentProcess( process );
+    BOOL deferred = FALSE;
     NTSTATUS status;
 
     if (!enter_syscall_callback())
-        return syscall_NtAllocateVirtualMemory( process, ret, zero_bits, size_ptr, type, protect );
+    {
+        if (is_current) deferred = begin_deferred_vm_mutation();
+        status = syscall_NtAllocateVirtualMemory( process, ret, zero_bits, size_ptr, type, protect );
+        end_deferred_vm_mutation( deferred, status );
+        return status;
+    }
 
     if (!*ret && (type & MEM_COMMIT)) type |= MEM_RESERVE;
 
@@ -602,6 +913,9 @@ NTSTATUS SYSCALL_API NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_
     if (!is_current) send_cross_process_notification( process, CrossProcessPostVirtualAlloc,
                                                       *ret, *size_ptr, 3, type, protect, status );
     else if (pNotifyMemoryAlloc) pNotifyMemoryAlloc( *ret, *size_ptr, type, protect, TRUE, status );
+    if (is_current && NT_SUCCESS(status) &&
+        (!pNotifyMemoryAlloc || (type & (MEM_RESET | MEM_RESET_UNDO))))
+        mark_deferred_provider_resync();
 
     leave_syscall_callback();
     return status;
@@ -611,10 +925,17 @@ NTSTATUS SYSCALL_API NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE
                                                 ULONG protect, MEM_EXTENDED_PARAMETER *parameters, ULONG count )
 {
     BOOL is_current = RtlIsCurrentProcess( process );
+    BOOL deferred = FALSE;
     NTSTATUS status;
 
     if (!enter_syscall_callback())
-        return syscall_NtAllocateVirtualMemoryEx( process, ret, size_ptr, type, protect, parameters, count );
+    {
+        if (is_current) deferred = begin_deferred_vm_mutation();
+        status = syscall_NtAllocateVirtualMemoryEx( process, ret, size_ptr, type, protect,
+                                                    parameters, count );
+        end_deferred_vm_mutation( deferred, status );
+        return status;
+    }
 
     if (!*ret && (type & MEM_COMMIT)) type |= MEM_RESERVE;
 
@@ -627,6 +948,9 @@ NTSTATUS SYSCALL_API NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE
     if (!is_current) send_cross_process_notification( process, CrossProcessPostVirtualAlloc,
                                                       *ret, *size_ptr, 3, type, protect, status );
     else if (pNotifyMemoryAlloc) pNotifyMemoryAlloc( *ret, *size_ptr, type, protect, TRUE, status );
+    if (is_current && NT_SUCCESS(status) &&
+        (!pNotifyMemoryAlloc || (type & (MEM_RESET | MEM_RESET_UNDO))))
+        mark_deferred_provider_resync();
 
     leave_syscall_callback();
     return status;
@@ -636,7 +960,7 @@ NTSTATUS SYSCALL_API NtContinue( CONTEXT *context, BOOLEAN alertable )
 {
     ARM64_NT_CONTEXT arm_ctx;
 
-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+    context_x64_to_arm_guest_return( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
     return syscall_NtContinue( &arm_ctx, alertable );
 }
 
@@ -644,15 +968,21 @@ NTSTATUS SYSCALL_API NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
 {
     ARM64_NT_CONTEXT arm_ctx;
 
-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+    context_x64_to_arm_guest_return( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
     return syscall_NtContinueEx( &arm_ctx, args );
 }
 
 NTSTATUS SYSCALL_API NtFlushInstructionCache( HANDLE process, const void *addr, SIZE_T size )
 {
-    NTSTATUS status = syscall_NtFlushInstructionCache( process, addr, size );
+    BOOL nested = RtlIsCurrentProcess( process ) && get_arm64ec_cpu_area()->InSyscallCallback;
+    BOOL deferred = FALSE;
+    NTSTATUS status;
 
-    if (!status && enter_syscall_callback())
+    if (nested && pBTCpu64FlushInstructionCache) deferred = begin_deferred_vm_mutation();
+    status = syscall_NtFlushInstructionCache( process, addr, size );
+    end_deferred_vm_mutation( deferred, status );
+
+    if (!nested && !status && enter_syscall_callback())
     {
         if (!RtlIsCurrentProcess( process ))
             send_cross_process_notification( process, CrossProcessFlushCache, addr, size, 0 );
@@ -666,10 +996,16 @@ NTSTATUS SYSCALL_API NtFlushInstructionCache( HANDLE process, const void *addr, 
 NTSTATUS SYSCALL_API NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr, ULONG type )
 {
     BOOL is_current = RtlIsCurrentProcess( process );
+    BOOL deferred = FALSE;
     NTSTATUS status;
 
     if (!enter_syscall_callback())
-        return syscall_NtFreeVirtualMemory( process, addr_ptr, size_ptr, type );
+    {
+        if (is_current) deferred = begin_deferred_vm_mutation();
+        status = syscall_NtFreeVirtualMemory( process, addr_ptr, size_ptr, type );
+        end_deferred_vm_mutation( deferred, status );
+        return status;
+    }
 
     if (!is_current) send_cross_process_notification( process, CrossProcessPreVirtualFree,
                                                       *addr_ptr, *size_ptr, 2, type, 0 );
@@ -680,6 +1016,8 @@ NTSTATUS SYSCALL_API NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_
     if (!is_current) send_cross_process_notification( process, CrossProcessPostVirtualFree,
                                                       *addr_ptr, *size_ptr, 2, type, status );
     else if (pNotifyMemoryFree) pNotifyMemoryFree( *addr_ptr, *size_ptr, type, TRUE, status );
+    if (is_current && NT_SUCCESS(status) && !pNotifyMemoryFree)
+        mark_deferred_provider_resync();
 
     leave_syscall_callback();
     return status;
@@ -694,19 +1032,22 @@ NTSTATUS SYSCALL_API NtGetContextThread( HANDLE handle, CONTEXT *context )
     return status;
 }
 
-static void notify_map_view_of_section( HANDLE handle, void *addr, SIZE_T size, ULONG alloc,
+static BOOL notify_map_view_of_section( HANDLE handle, void *addr, SIZE_T size, ULONG alloc,
                                         ULONG protect, NTSTATUS *ret_status )
 {
     SECTION_IMAGE_INFORMATION info;
     NTSTATUS status;
 
-    if (!pNotifyMapViewOfSection) return;
-    if (!NtCurrentTeb()->Tib.ArbitraryUserPointer) return;
-    if (NtQuerySection( handle, SectionImageInformation, &info, sizeof(info), NULL )) return;
+    if (!pNotifyMapViewOfSection) return FALSE;
+    if (!NtCurrentTeb()->Tib.ArbitraryUserPointer) return FALSE;
+    if (NtQuerySection( handle, SectionImageInformation, &info, sizeof(info), NULL )) return FALSE;
     status = pNotifyMapViewOfSection( NULL, addr, NULL, size, alloc, protect );
-    if (NT_SUCCESS(status)) return;
-    NtUnmapViewOfSection( GetCurrentProcess(), addr );
-    *ret_status = status;
+    if (!NT_SUCCESS(status))
+    {
+        NtUnmapViewOfSection( GetCurrentProcess(), addr );
+        *ret_status = status;
+    }
+    return TRUE;
 }
 
 NTSTATUS SYSCALL_API NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_ptr,
@@ -714,12 +1055,20 @@ NTSTATUS SYSCALL_API NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *a
                                          const LARGE_INTEGER *offset, SIZE_T *size_ptr,
                                          SECTION_INHERIT inherit, ULONG alloc_type, ULONG protect )
 {
-    NTSTATUS status = syscall_NtMapViewOfSection( handle, process, addr_ptr, zero_bits, commit_size,
-                                                  offset, size_ptr, inherit, alloc_type, protect );
+    BOOL nested = RtlIsCurrentProcess( process ) && get_arm64ec_cpu_area()->InSyscallCallback;
+    BOOL deferred = FALSE;
+    NTSTATUS status;
 
-    if (NT_SUCCESS(status) && RtlIsCurrentProcess( process ) && enter_syscall_callback())
+    if (nested) deferred = begin_deferred_vm_mutation();
+    status = syscall_NtMapViewOfSection( handle, process, addr_ptr, zero_bits, commit_size,
+                                         offset, size_ptr, inherit, alloc_type, protect );
+    end_deferred_vm_mutation( deferred, status );
+
+    if (!nested && NT_SUCCESS(status) && RtlIsCurrentProcess( process ) && enter_syscall_callback())
     {
-        notify_map_view_of_section( handle, *addr_ptr, *size_ptr, alloc_type, protect, &status );
+        if (!notify_map_view_of_section( handle, *addr_ptr, *size_ptr,
+                                         alloc_type, protect, &status ))
+            mark_deferred_provider_resync();
         leave_syscall_callback();
     }
     return status;
@@ -729,12 +1078,20 @@ NTSTATUS SYSCALL_API NtMapViewOfSectionEx( HANDLE handle, HANDLE process, PVOID 
                                            const LARGE_INTEGER *offset, SIZE_T *size_ptr, ULONG alloc_type,
                                            ULONG protect, MEM_EXTENDED_PARAMETER *parameters, ULONG count )
 {
-    NTSTATUS status = syscall_NtMapViewOfSectionEx( handle, process, addr_ptr, offset, size_ptr,
-                                                    alloc_type, protect, parameters, count );
+    BOOL nested = RtlIsCurrentProcess( process ) && get_arm64ec_cpu_area()->InSyscallCallback;
+    BOOL deferred = FALSE;
+    NTSTATUS status;
 
-    if (NT_SUCCESS(status) && RtlIsCurrentProcess( process ) && enter_syscall_callback())
+    if (nested) deferred = begin_deferred_vm_mutation();
+    status = syscall_NtMapViewOfSectionEx( handle, process, addr_ptr, offset, size_ptr,
+                                           alloc_type, protect, parameters, count );
+    end_deferred_vm_mutation( deferred, status );
+
+    if (!nested && NT_SUCCESS(status) && RtlIsCurrentProcess( process ) && enter_syscall_callback())
     {
-        notify_map_view_of_section( handle, *addr_ptr, *size_ptr, alloc_type, protect, &status );
+        if (!notify_map_view_of_section( handle, *addr_ptr, *size_ptr,
+                                         alloc_type, protect, &status ))
+            mark_deferred_provider_resync();
         leave_syscall_callback();
     }
     return status;
@@ -744,10 +1101,16 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
                                              ULONG new_prot, ULONG *old_prot )
 {
     BOOL is_current = RtlIsCurrentProcess( process );
+    BOOL deferred = FALSE;
     NTSTATUS status;
 
     if (!enter_syscall_callback())
-        return syscall_NtProtectVirtualMemory( process, addr_ptr, size_ptr, new_prot, old_prot );
+    {
+        if (is_current) deferred = begin_deferred_vm_mutation();
+        status = syscall_NtProtectVirtualMemory( process, addr_ptr, size_ptr, new_prot, old_prot );
+        end_deferred_vm_mutation( deferred, status );
+        return status;
+    }
 
     if (!is_current) send_cross_process_notification( process, CrossProcessPreVirtualProtect,
                                                       *addr_ptr, *size_ptr, 2, new_prot, 0 );
@@ -758,6 +1121,8 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
     if (!is_current) send_cross_process_notification( process, CrossProcessPostVirtualProtect,
                                                       *addr_ptr, *size_ptr, 2, new_prot, status );
     else if (pNotifyMemoryProtect) pNotifyMemoryProtect( *addr_ptr, *size_ptr, new_prot, TRUE, status );
+    if (is_current && NT_SUCCESS(status) && !pNotifyMemoryProtect)
+        mark_deferred_provider_resync();
 
     leave_syscall_callback();
     return status;
@@ -775,7 +1140,7 @@ NTSTATUS SYSCALL_API NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, 
 {
     ARM64_NT_CONTEXT arm_ctx;
 
-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+    context_x64_to_arm_guest_return( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
     return syscall_NtRaiseException( rec, &arm_ctx, first_chance );
 }
 
@@ -783,24 +1148,40 @@ NTSTATUS SYSCALL_API NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
                                  IO_STATUS_BLOCK *io, void *buffer, ULONG length,
                                  LARGE_INTEGER *offset, ULONG *key )
 {
+    BOOL nested = get_arm64ec_cpu_area()->InSyscallCallback;
+    BOOL deferred = FALSE;
     NTSTATUS status;
 
+    if (nested)
+    {
+        if (pBTCpu64NotifyReadFile) deferred = begin_deferred_vm_mutation();
+        status = syscall_NtReadFile( handle, event, apc, apc_user, io, buffer,
+                                     length, offset, key );
+        /* An asynchronous completion is not authoritative yet; its eventual
+         * completion path remains responsible for publishing the dirty data. */
+        end_deferred_vm_mutation( deferred, status == STATUS_PENDING ?
+                                 STATUS_UNSUCCESSFUL : status );
+        return status;
+    }
     if (pBTCpu64NotifyReadFile && enter_syscall_callback())
     {
         pBTCpu64NotifyReadFile( handle, buffer, length, FALSE, 0 );
-        status = syscall_NtReadFile( handle, event, apc, apc_user, io, buffer, length, offset, key );
-        if (pBTCpu64NotifyReadFile) pBTCpu64NotifyReadFile( handle, buffer, length, TRUE, status );
         leave_syscall_callback();
-        return status;
     }
-    return syscall_NtReadFile( handle, event, apc, apc_user, io, buffer, length, offset, key );
+    status = syscall_NtReadFile( handle, event, apc, apc_user, io, buffer, length, offset, key );
+    if (pBTCpu64NotifyReadFile && enter_syscall_callback())
+    {
+        pBTCpu64NotifyReadFile( handle, buffer, length, TRUE, status );
+        leave_syscall_callback();
+    }
+    return status;
 }
 
 NTSTATUS SYSCALL_API NtSetContextThread( HANDLE handle, const CONTEXT *context )
 {
     ARM64_NT_CONTEXT arm_ctx;
 
-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+    context_x64_to_arm_guest_return( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
     return syscall_NtSetContextThread( handle, &arm_ctx );
 }
 
@@ -821,11 +1202,21 @@ NTSTATUS SYSCALL_API NtTerminateProcess( HANDLE handle, LONG exit_code )
 
 NTSTATUS SYSCALL_API NtTerminateThread( HANDLE handle, LONG exit_code )
 {
+    LONGLONG token_sequence = 0, token_generation = 0;
+    void *thread_state;
+    BOOL thread_token;
     NTSTATUS status;
 
     if (pThreadTerm && enter_syscall_callback())
     {
+        thread_state = get_arm64ec_cpu_area()->EmulatorData[0];
+        thread_token = capture_deferred_provider_sync_token( &token_sequence,
+                                                              &token_generation );
         pThreadTerm( handle, exit_code );
+        if (thread_token && thread_state &&
+            !get_arm64ec_cpu_area()->EmulatorData[0])
+            acknowledge_single_deferred_provider_mutation( token_sequence,
+                                                            token_generation );
         status = syscall_NtTerminateThread( handle, exit_code );
         leave_syscall_callback();
         return status;
@@ -836,13 +1227,28 @@ NTSTATUS SYSCALL_API NtTerminateThread( HANDLE handle, LONG exit_code )
 NTSTATUS SYSCALL_API NtUnmapViewOfSection( HANDLE process, void *addr )
 {
     BOOL is_current = RtlIsCurrentProcess( process );
+    BOOL deferred;
     NTSTATUS status;
 
+    if (is_current && get_arm64ec_cpu_area()->InSyscallCallback)
+    {
+        deferred = begin_deferred_vm_mutation();
+        status = syscall_NtUnmapViewOfSection( process, addr );
+        end_deferred_vm_mutation( deferred, status );
+        return status;
+    }
     if (is_current && pNotifyUnmapViewOfSection && enter_syscall_callback())
     {
         pNotifyUnmapViewOfSection( addr, FALSE, 0 );
         status = syscall_NtUnmapViewOfSection( process, addr );
         pNotifyUnmapViewOfSection( addr, TRUE, status );
+        leave_syscall_callback();
+        return status;
+    }
+    if (is_current && enter_syscall_callback())
+    {
+        status = syscall_NtUnmapViewOfSection( process, addr );
+        if (NT_SUCCESS(status)) mark_deferred_provider_resync();
         leave_syscall_callback();
         return status;
     }
@@ -852,13 +1258,28 @@ NTSTATUS SYSCALL_API NtUnmapViewOfSection( HANDLE process, void *addr )
 NTSTATUS SYSCALL_API NtUnmapViewOfSectionEx( HANDLE process, void *addr, ULONG flags )
 {
     BOOL is_current = RtlIsCurrentProcess( process );
+    BOOL deferred;
     NTSTATUS status;
 
+    if (is_current && get_arm64ec_cpu_area()->InSyscallCallback)
+    {
+        deferred = begin_deferred_vm_mutation();
+        status = syscall_NtUnmapViewOfSectionEx( process, addr, flags );
+        end_deferred_vm_mutation( deferred, status );
+        return status;
+    }
     if (is_current && pNotifyUnmapViewOfSection && enter_syscall_callback())
     {
         pNotifyUnmapViewOfSection( addr, FALSE, 0 );
         status = syscall_NtUnmapViewOfSectionEx( process, addr, flags );
         pNotifyUnmapViewOfSection( addr, TRUE, status );
+        leave_syscall_callback();
+        return status;
+    }
+    if (is_current && enter_syscall_callback())
+    {
+        status = syscall_NtUnmapViewOfSectionEx( process, addr, flags );
+        if (NT_SUCCESS(status)) mark_deferred_provider_resync();
         leave_syscall_callback();
         return status;
     }
@@ -871,7 +1292,7 @@ asm( ".section .rdata, \"dr\"\n\t"
      ".globl arm64ec_syscalls\n"
      "arm64ec_syscalls:\n\t"
 #define SYSCALL_ENTRY(id,name,args) ".quad \"#" #name "$hp_target\"\n\t"
-     ALL_SYSCALLS64
+     ALL_SYSCALLS
 #undef SYSCALL_ENTRY
      ".text" );
 
@@ -1083,6 +1504,17 @@ static DWORD __attribute__((naked)) call_unwind_handler( EXCEPTION_RECORD *rec, 
 }
 
 
+/*******************************************************************
+ *         nested_exception_handler
+ */
+EXCEPTION_DISPOSITION WINAPI nested_exception_handler( EXCEPTION_RECORD *rec, void *frame,
+                                                       CONTEXT *context, void *dispatch )
+{
+    if (rec->ExceptionFlags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND)) return ExceptionContinueSearch;
+    return ExceptionNestedException;
+}
+
+
 /***********************************************************************
  *		call_seh_handler
  */
@@ -1219,7 +1651,6 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
 void dispatch_emulation( ARM64_NT_CONTEXT *arm_ctx )
 {
     context_arm_to_x64( get_arm64ec_cpu_area()->ContextAmd64, arm_ctx );
-    get_arm64ec_cpu_area()->InSimulation = 1;
     pBeginSimulation();
 }
 __ASM_GLOBAL_FUNC( "#KiUserEmulationDispatcher",
@@ -1241,15 +1672,35 @@ static void dispatch_syscall( ARM64_NT_CONTEXT *context )
         context->X4 = context->Pc;  /* and save return address to syscall thunk */
         context->Pc = (ULONG_PTR)invoke_arm64ec_syscall;
     }
-    else context->X8 = STATUS_INVALID_PARAMETER;  /* set return value in rax */
+    else context->X8 = STATUS_INVALID_SYSTEM_SERVICE;  /* set return value in rax */
 
     /* return to x64 code so that the syscall entry thunk is invoked properly */
+    get_arm64ec_cpu_area()->InSimulation = 1;
     dispatch_emulation( context );
 }
 
 
 static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD *rec, ARM64EC_NT_CONTEXT *context, ARM64_NT_CONTEXT *arm_ctx )
 {
+    if (rec->ExceptionCode == STATUS_WINE_NATIVE_GUARD)
+    {
+        struct native_guard_params params = { .pc = arm_ctx->Pc };
+        NTSTATUS status = WINE_UNIX_CALL( unix_resolve_native_guard, &params );
+
+        /* Unsupported stack geometry must not re-enter a protected native SP.
+         * Guaranteed-space overflow itself now uses ordinary first-chance SEH. */
+        if (status == STATUS_NOT_SUPPORTED) RtlExitUserThread( status );
+        if (!status) status = syscall_NtContinue( arm_ctx, FALSE );
+        rec->ExceptionCode = status;
+        rec->ExceptionFlags = 0;
+        rec->NumberParameters = status == STATUS_STACK_OVERFLOW ? 0 : 2;
+        rec->ExceptionInformation[0] = params.write ? EXCEPTION_WRITE_FAULT : EXCEPTION_READ_FAULT;
+        rec->ExceptionInformation[1] = params.address;
+        /* Re-enter normal first-chance dispatch, including debugger handling,
+         * with the original native context and PC. */
+        status = syscall_NtRaiseException( rec, arm_ctx, TRUE );
+        RtlRaiseStatus( status );
+    }
     if (rec->ExceptionCode == STATUS_EMULATION_SYSCALL) dispatch_syscall( arm_ctx );
     context_arm_to_x64( context, arm_ctx );
     if (pResetToConsistentState) pResetToConsistentState( rec, &context->AMD64_Context, arm_ctx );
@@ -1347,7 +1798,10 @@ __ASM_GLOBAL_FUNC( "#KiUserCallbackDispatcher",
 BOOLEAN WINAPI RtlIsEcCode( ULONG_PTR ptr )
 {
     const UINT64 *map = (const UINT64 *)NtCurrentTeb()->Peb->EcCodeBitMap;
-    ULONG_PTR page = ptr / page_size;
+    ULONG_PTR page;
+
+    if (!map || !wine_arm64ec_code_pointer_in_range( ptr )) return FALSE;
+    page = ptr / page_size;
     return (map[page / 64] >> (page & 63)) & 1;
 }
 
@@ -1377,7 +1831,8 @@ static void __attribute__((used)) capture_context( CONTEXT *context, UINT cpsr, 
     /* unwind one level to get register values from caller function */
     unwind_context = *context;
     unwind_one_frame( &unwind_context );
-    memcpy( &context->Rax, &unwind_context.Rax, offsetof(CONTEXT,FltSave) - offsetof(CONTEXT,Rax) );
+    if (!RtlIsEcCode( unwind_context.Rip ))
+        memcpy( &context->Rax, &unwind_context.Rax, offsetof(CONTEXT,FltSave) - offsetof(CONTEXT,Rax) );
 }
 
 /***********************************************************************
@@ -1571,7 +2026,7 @@ void CDECL RtlRestoreContext( CONTEXT *context, EXCEPTION_RECORD *rec )
     }
 
     /* hack: remove no longer accessible TEB frames */
-    while ((ULONG64)teb_frame < context->Rsp)
+    while (is_valid_frame( (ULONG_PTR)teb_frame ) && (ULONG64)teb_frame < context->Rsp)
     {
         TRACE( "removing TEB frame: %p\n", teb_frame );
         teb_frame = __wine_pop_frame( teb_frame );
@@ -1643,7 +2098,8 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
 
         if (dispatch.LanguageHandler)
         {
-            if (end_frame && (dispatch.EstablisherFrame > (ULONG64)end_frame))
+            if (end_frame && (dispatch.EstablisherFrame > (ULONG64)end_frame) &&
+                !is_exception_stack_frame( dispatch.EstablisherFrame ))
             {
                 ERR( "invalid end frame %I64x/%p\n", dispatch.EstablisherFrame, end_frame );
                 raise_status( STATUS_INVALID_UNWIND_TARGET, rec );
@@ -1759,7 +2215,22 @@ BOOLEAN WINAPI RtlIsProcessorFeaturePresent( UINT feature )
         (1ull << PF_ARM_V81_ATOMIC_INSTRUCTIONS_AVAILABLE) |
         (1ull << PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE) |
         (1ull << PF_ARM_V83_JSCVT_INSTRUCTIONS_AVAILABLE) |
-        (1ull << PF_ARM_V83_LRCPC_INSTRUCTIONS_AVAILABLE);
+        (1ull << PF_ARM_V83_LRCPC_INSTRUCTIONS_AVAILABLE) |
+        (1ull << PF_ARM_SVE_INSTRUCTIONS_AVAILABLE) |
+        (1ull << PF_ARM_SVE2_INSTRUCTIONS_AVAILABLE) |
+        (1ull << PF_ARM_SVE2_1_INSTRUCTIONS_AVAILABLE) |
+        (1ull << PF_ARM_SVE_AES_INSTRUCTIONS_AVAILABLE) |
+        (1ull << PF_ARM_SVE_PMULL128_INSTRUCTIONS_AVAILABLE) |
+        (1ull << PF_ARM_SVE_BITPERM_INSTRUCTIONS_AVAILABLE) |
+        (1ull << PF_ARM_SVE_BF16_INSTRUCTIONS_AVAILABLE) |
+        (1ull << PF_ARM_SVE_EBF16_INSTRUCTIONS_AVAILABLE) |
+        (1ull << PF_ARM_SVE_B16B16_INSTRUCTIONS_AVAILABLE) |
+        (1ull << PF_ARM_SVE_SHA3_INSTRUCTIONS_AVAILABLE) |
+        (1ull << PF_ARM_SVE_SM4_INSTRUCTIONS_AVAILABLE) |
+        (1ull << PF_ARM_SVE_I8MM_INSTRUCTIONS_AVAILABLE) |
+        (1ull << PF_ARM_SVE_F32MM_INSTRUCTIONS_AVAILABLE) |
+        (1ull << PF_ARM_SVE_F64MM_INSTRUCTIONS_AVAILABLE) |
+        (1ull << PF_ARM_LSE2_AVAILABLE);
 
     if (feature >= PROCESSOR_FEATURE_MAX) return FALSE;
     if (arm64_features & (1ull << feature)) return user_shared_data->ProcessorFeatures[feature];
@@ -1825,6 +2296,9 @@ static void __attribute__((naked)) arm64x_check_icall_early(void)
     asm( "ret" );
 }
 
+#define ARM64EC_STRINGIFY_(value) #value
+#define ARM64EC_STRINGIFY(value) ARM64EC_STRINGIFY_(value)
+
 /**************************************************************************
  *		arm64x_check_call
  *
@@ -1835,13 +2309,21 @@ static void __attribute__((naked)) arm64x_check_call(void)
     asm( ".seh_proc \"#arm64x_check_call\"\n\t"
          ".seh_endprologue\n\t"
          /* check for EC code */
+         "lsr x16, x11, #" ARM64EC_STRINGIFY(WINE_ARM64EC_CODE_POINTER_BITS) "\n\t"
+         "cbnz x16, .Lexit\n\t"
          "ldr x16, [x18, #0x60]\n\t"        /* peb */
          "lsr x17, x11, #18\n\t"            /* dest / page_size / 64 */
          "ldr x16, [x16, #0x368]\n\t"       /* peb->EcCodeBitMap */
+         "cbz x16, .Lexit\n\t"
          "lsr x9, x11, #12\n\t"             /* dest / page_size */
          "ldr x16, [x16, x17, lsl #3]\n\t"
          "lsr x16, x16, x9\n\t"
          "tbnz x16, #0, .Ldone\n\t"
+         /* A low target not marked as EC code belongs to the translated x64
+          * address domain.  Its bytes may live only in the native shadow, so
+          * let the emulator fetch (or fault) through the guest mapping. */
+         "lsr x16, x11, #32\n\t"
+         "cbz x16, .Lexit\n\t"
          /* check if dest is aligned */
          "tst x11, #15\n\t"                 /* dest & 15 */
          "b.ne .Ljmp\n\t"
@@ -1964,6 +2446,9 @@ LONG __attribute__((naked)) __C_ExecuteExceptionFilter( EXCEPTION_POINTERS *ptrs
          ".seh_endproc" );
 }
 
+#undef ARM64EC_STRINGIFY
+#undef ARM64EC_STRINGIFY_
+
 
 /***********************************************************************
  *		RtlRaiseException (NTDLL.@)
@@ -1981,8 +2466,12 @@ void __attribute((naked)) RtlRaiseException( EXCEPTION_RECORD *rec )
          "add x0, sp, #0x20\n\t"
          "bl \"#RtlCaptureContext\"\n\t"
          "add x1, sp, #0x20\n\t"       /* context pointer */
+         "add x0, x1, #0x4d0\n\t"      /* orig stack pointer */
+         "str x0, [x1, #0x98]\n\t"     /* context->Rsp */
          "ldr x0, [sp, #0x10]\n\t"     /* rec */
-         "ldr x2, [x1, #0xf8]\n\t"     /* context->Rip */
+         "str x0, [x1, #0x80]\n\t"     /* context->Rcx */
+         "ldr x2, [sp, #0x08]\n\t"     /* return address */
+         "str x2, [x1, #0xf8]\n\t"     /* context->Rip */
          "str x2, [x0, #0x10]\n\t"     /* rec->ExceptionAddress */
          "ldr w2, [x1, #0x30]\n\t"     /* context->ContextFlags */
          "orr w2, w2, #0x20000000\n\t" /* CONTEXT_UNWOUND_TO_CALL */

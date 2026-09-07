@@ -35,7 +35,6 @@
 #include <unistd.h>
 
 #include "ntstatus.h"
-#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winnt.h"
 #include "winternl.h"
@@ -69,11 +68,7 @@ static const char * const debug_classes[] = { "fixme", "err", "warn", "trace" };
 static inline struct debug_info *get_info(void)
 {
     if (!init_done) return &initial_info;
-#ifdef _WIN64
-    return (struct debug_info *)((TEB32 *)((char *)NtCurrentTeb() + teb_offset) + 1);
-#else
-    return (struct debug_info *)(NtCurrentTeb() + 1);
-#endif
+    return (struct debug_info *)get_thread_data()->debug_info;
 }
 
 /* add a string to the output buffer */
@@ -282,6 +277,47 @@ NTSTATUS unixcall_wine_dbg_write( void *args )
     return write( 2, params->str, params->len );
 }
 
+/***********************************************************************
+ *		unixcall_get_current_teb
+ */
+NTSTATUS unixcall_get_current_teb( void *args )
+{
+    struct current_teb_params *params = args;
+    struct thread_data *data = get_thread_data();
+
+    params->teb = data ? data->teb : NULL;
+    return params->teb ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
+/***********************************************************************
+ *		unixcall_get_native_callback_context
+ */
+NTSTATUS unixcall_get_native_callback_context( void *args )
+{
+    struct native_callback_context_params *params = args;
+#if defined(__APPLE__) && defined(__x86_64__)
+    enum { switchyard_amd64_pthread_teb_offset = 0x320 };
+    enum { switchyard_amd64_native_callback_depth_offset = 0x344 };
+    struct thread_data *data = get_thread_data();
+#endif
+
+    params->teb = NULL;
+    params->pthread_teb = NULL;
+    params->native_callback_depth = NULL;
+    params->get_teb_from_pthread = NULL;
+#if defined(__APPLE__) && defined(__x86_64__)
+    if (!data || !data->teb) return STATUS_UNSUCCESSFUL;
+
+    params->teb = data->teb;
+    params->pthread_teb = *(void **)((char *)data->teb + switchyard_amd64_pthread_teb_offset);
+    params->native_callback_depth = (char *)data->teb + switchyard_amd64_native_callback_depth_offset;
+    params->get_teb_from_pthread = __wine_get_current_teb_from_pthread;
+    return params->pthread_teb ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
 #ifdef _WIN64
 /***********************************************************************
  *		wow64_wine_dbg_write
@@ -292,9 +328,55 @@ NTSTATUS wow64_wine_dbg_write( void *args )
     {
         ULONG        str;
         unsigned int len;
-    } const *params32 = args;
+    } params32;
+    char buffer[1024];
+    SIZE_T offset = 0;
 
-    return write( 2, ULongToPtr(params32->str), params32->len );
+    if (virtual_copy_from_user( &params32, args, sizeof(params32) )) return -1;
+    if (params32.len && (!params32.str ||
+        params32.len > 0x100000000ull - params32.str)) return -1;
+
+    while (offset < params32.len)
+    {
+        SIZE_T count = min( sizeof(buffer), params32.len - offset );
+        ssize_t ret;
+
+        if (virtual_copy_from_user( buffer,
+                                    (char *)wow64_guest_to_native_ptr( params32.str ) + offset,
+                                    count ))
+            return offset ? (NTSTATUS)offset : -1;
+        ret = write( 2, buffer, count );
+        if (ret <= 0) return offset ? (NTSTATUS)offset : ret;
+        offset += ret;
+        if (ret < count) break;
+    }
+
+    return offset;
+}
+
+/***********************************************************************
+ *		wow64_get_current_teb
+ */
+NTSTATUS wow64_get_current_teb( void *args )
+{
+    struct
+    {
+        ULONG teb;
+    } params32;
+    struct thread_data *data = get_thread_data();
+    void *teb = data ? get_wow_teb( data->teb ) : NULL;
+
+    params32.teb = wow64_native_to_guest_addr( teb );
+    if (!teb) return STATUS_UNSUCCESSFUL;
+    return virtual_faulting_copy_to_user( args, &params32, sizeof(params32) );
+}
+
+/***********************************************************************
+ *		wow64_get_native_callback_context
+ */
+NTSTATUS wow64_get_native_callback_context( void *args )
+{
+    return STATUS_NOT_SUPPORTED;
 }
 #endif
 
@@ -340,8 +422,8 @@ int __cdecl __wine_dbg_header( enum __wine_debug_class cls, struct __wine_debug_
             UINT ticks = NtGetTickCount();
             pos += snprintf( pos, sizeof(info->output) - (pos - info->output), "%3u.%03u:", ticks / 1000, ticks % 1000 );
         }
-        if (TRACE_ON(pid)) pos += snprintf( pos, sizeof(info->output) - (pos - info->output), "%04x:", (UINT)GetCurrentProcessId() );
-        pos += snprintf( pos, sizeof(info->output) - (pos - info->output), "%04x:", (UINT)GetCurrentThreadId() );
+        if (TRACE_ON(pid)) pos += snprintf( pos, sizeof(info->output) - (pos - info->output), "%04x:", pid );
+        pos += snprintf( pos, sizeof(info->output) - (pos - info->output), "%04x:", GetCurrentThreadId() );
     }
     if (function && cls < ARRAY_SIZE( classes ))
         pos += snprintf( pos, sizeof(info->output) - (pos - info->output), "%s:%s:%s ",
@@ -378,7 +460,7 @@ NTSTATUS WINAPI NtTraceControl( ULONG code, void *inbuf, ULONG inbuf_len,
                                 void *outbuf, ULONG outbuf_len, ULONG *size )
 {
     FIXME( "code %u, inbuf %p, inbuf_len %u, outbuf %p, outbuf_len %u, size %p\n",
-           (int)code, inbuf, (int)inbuf_len, outbuf, (int)outbuf_len, size );
+           code, inbuf, inbuf_len, outbuf, outbuf_len, size );
     return STATUS_SUCCESS;
 }
 
@@ -388,7 +470,7 @@ NTSTATUS WINAPI NtTraceControl( ULONG code, void *inbuf, ULONG inbuf_len,
  */
 NTSTATUS WINAPI NtSetDebugFilterState( ULONG component_id, ULONG level, BOOLEAN state )
 {
-    FIXME( "component_id %#x, level %u, state %#x stub.\n", (int)component_id, (int)level, state );
+    FIXME( "component_id %#x, level %u, state %#x stub.\n", component_id, level, state );
 
     return STATUS_SUCCESS;
 }

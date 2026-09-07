@@ -29,6 +29,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -36,9 +37,11 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#ifdef HAVE_SYS_PERSONALITY_H
+#include <sys/personality.h>
+#endif
 
 #include "ntstatus.h"
-#define WIN32_NO_STATUS
 #include "object.h"
 #include "file.h"
 #include "handle.h"
@@ -164,7 +167,7 @@ struct file_load_info
 static void key_dump( struct object *obj, int verbose );
 static unsigned int key_map_access( struct object *obj, unsigned int access );
 static struct security_descriptor *key_get_sd( struct object *obj );
-static WCHAR *key_get_full_name( struct object *obj, data_size_t *len );
+static WCHAR *key_get_full_name( struct object *obj, data_size_t max, data_size_t *len );
 static struct object *key_lookup_name( struct object *obj, struct unicode_str *name,
                                        unsigned int attr, struct object *root );
 static int key_link_name( struct object *obj, struct object_name *name, struct object *parent );
@@ -180,10 +183,10 @@ static const struct object_ops key_ops =
     no_add_queue,            /* add_queue */
     NULL,                    /* remove_queue */
     NULL,                    /* signaled */
-    NULL,                    /* get_msync_idx */
     NULL,                    /* satisfied */
     no_signal,               /* signal */
     no_get_fd,               /* get_fd */
+    default_get_sync,        /* get_sync */
     key_map_access,          /* map_access */
     key_get_sd,              /* get_sd */
     default_set_sd,          /* set_sd */
@@ -462,7 +465,7 @@ static struct security_descriptor *key_get_sd( struct object *obj )
     return key_default_sd;
 }
 
-static WCHAR *key_get_full_name( struct object *obj, data_size_t *ret_len )
+static WCHAR *key_get_full_name( struct object *obj, data_size_t max, data_size_t *ret_len )
 {
     struct key *key = (struct key *) obj;
 
@@ -471,7 +474,7 @@ static WCHAR *key_get_full_name( struct object *obj, data_size_t *ret_len )
         set_error( STATUS_KEY_DELETED );
         return NULL;
     }
-    return default_get_full_name( obj, ret_len );
+    return default_get_full_name( obj, max, ret_len );
 }
 
 static struct object *key_lookup_name( struct object *obj, struct unicode_str *name,
@@ -933,7 +936,7 @@ static void enum_key( struct key *key, int index, int info_class, struct enum_ke
     switch(info_class)
     {
     case KeyNameInformation:
-        if (!(fullname = key->obj.ops->get_full_name( &key->obj, &namelen ))) return;
+        if (!(fullname = key->obj.ops->get_full_name( &key->obj, ~0u, &namelen ))) return;
         /* fall through */
     case KeyBasicInformation:
         classlen = 0; /* only return the name */
@@ -1038,7 +1041,7 @@ static void rename_key( struct key *key, const struct unicode_str *new_name )
     for (cur_index = 0; cur_index <= parent->last_subkey; cur_index++)
         if (parent->subkeys[cur_index] == key) break;
 
-    if (cur_index < index && (index - cur_index) > 1)
+    if (cur_index < index)
     {
         --index;
         for (i = cur_index; i < index; ++i) parent->subkeys[i] = parent->subkeys[i+1];
@@ -1845,6 +1848,19 @@ static WCHAR *format_user_registry_path( const struct sid *sid, struct unicode_s
     return ascii_to_unicode_str( buffer, path );
 }
 
+#ifdef __aarch64__
+static bool supports_aarch32(void)
+{
+#if defined(HAVE_SYS_PERSONALITY_H)
+    int old = personality( PER_LINUX32 );
+    if (old == -1) return false;
+    personality( old );
+    return true;
+#endif
+    return false;
+}
+#endif
+
 static void init_supported_machines(void)
 {
     unsigned int count = 0;
@@ -1860,7 +1876,8 @@ static void init_supported_machines(void)
     {
         supported_machines[count++] = IMAGE_FILE_MACHINE_ARM64;
         supported_machines[count++] = IMAGE_FILE_MACHINE_I386;
-        /* supported_machines[count++] = IMAGE_FILE_MACHINE_ARMNT;  not supported yet */
+        if (supports_aarch32()) supported_machines[count++] = IMAGE_FILE_MACHINE_ARMNT;
+        supported_machines[count++] = IMAGE_FILE_MACHINE_AMD64;
     }
 #else
 #error Unsupported machine
@@ -2160,12 +2177,6 @@ void flush_registry(void)
     if (fchdir( server_dir_fd ) == -1) fatal_error( "chdir to server dir: %s\n", strerror( errno ));
 }
 
-/* determine if the thread is wow64 (32-bit client running on 64-bit prefix) */
-static int is_wow64_thread( struct thread *thread )
-{
-    return (is_machine_64bit( native_machine ) && !is_machine_64bit( thread->process->machine ));
-}
-
 
 /* create a registry key */
 DECL_HANDLER(create_key)
@@ -2179,7 +2190,7 @@ DECL_HANDLER(create_key)
 
     if (!objattr) return;
 
-    if (!is_wow64_thread( current )) access = (access & ~KEY_WOW64_32KEY) | KEY_WOW64_64KEY;
+    if (!is_wow64_process( current->process )) access = (access & ~KEY_WOW64_32KEY) | KEY_WOW64_64KEY;
 
     if (objattr->rootdir)
     {
@@ -2210,7 +2221,7 @@ DECL_HANDLER(open_key)
     unsigned int access = req->access;
     struct unicode_str name = get_req_unicode_str();
 
-    if (!is_wow64_thread( current )) access = (access & ~KEY_WOW64_32KEY) | KEY_WOW64_64KEY;
+    if (!is_wow64_process( current->process )) access = (access & ~KEY_WOW64_32KEY) | KEY_WOW64_64KEY;
 
     if (req->parent && !(parent = get_hkey_obj( req->parent, 0 ))) return;
 

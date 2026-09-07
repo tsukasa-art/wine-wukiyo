@@ -31,6 +31,8 @@ struct vmr7_presenter
     IVMRWindowlessControl IVMRWindowlessControl_iface;
     LONG refcount;
 
+    IVMRSurfaceAllocatorNotify *notify;
+
     IDirectDraw7 *ddraw;
     IDirectDrawSurface7 *frontbuffer;
     IDirectDrawSurface7 *primary;
@@ -183,6 +185,12 @@ static HRESULT WINAPI surface_allocator_AllocateSurface(IVMRSurfaceAllocator *if
 
     TRACE("presenter %p, id %#Ix, info %p, count %p, surface %p.\n", presenter, id, info, count, surface);
 
+    if (info->lpHdr->biSize != sizeof(*info->lpHdr))
+    {
+        WARN("Invalid BITMAPINFOHEADER size %lu.\n", info->lpHdr->biSize);
+        return DDERR_INVALIDPIXELFORMAT;
+    }
+
     surface_desc.dwFlags = DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT | DDSD_CAPS | DDSD_BACKBUFFERCOUNT;
     surface_desc.dwWidth = info->lpHdr->biWidth;
     surface_desc.dwHeight = info->lpHdr->biHeight;
@@ -190,25 +198,42 @@ static HRESULT WINAPI surface_allocator_AllocateSurface(IVMRSurfaceAllocator *if
     surface_desc.ddsCaps.dwCaps = DDSCAPS_FLIP | DDSCAPS_COMPLEX | DDSCAPS_OFFSCREENPLAIN;
     surface_desc.dwBackBufferCount = *count;
 
-    if (info->lpHdr->biCompression == BI_RGB)
+    if (info->lpHdr->biCompression == BI_RGB || info->lpHdr->biCompression == BI_BITFIELDS)
     {
-        if (info->lpHdr->biBitCount != 32 && info->lpHdr->biBitCount != 24)
-        {
-            FIXME("Unhandled bit depth %u.\n", info->lpHdr->biBitCount);
-            return E_NOTIMPL;
-        }
+        DDSURFACEDESC2 primary_desc;
+        DWORD *mask;
 
-        /* Always allocate a 32-bit (X8R8G8B8) surface, even for 24-bit RGB
-         * input: wined3d/MoltenVK has no usable 24-bit (R8G8B8) offscreen
-         * surface format. 24-bit samples are widened to 32 bpp per pixel on
-         * copy (see vmr_render() in vmr7.c). NeXAS-engine movies
-         * deliver RGB24 through a SampleGrabber, which previously failed here
-         * with E_NOTIMPL -> no surface -> black movie. */
-        surface_desc.ddpfPixelFormat.dwFlags = DDPF_RGB;
-        surface_desc.ddpfPixelFormat.dwRGBBitCount = 32;
-        surface_desc.ddpfPixelFormat.dwRBitMask = 0x00ff0000;
-        surface_desc.ddpfPixelFormat.dwGBitMask = 0x0000ff00;
-        surface_desc.ddpfPixelFormat.dwBBitMask = 0x000000ff;
+        primary_desc.dwSize = sizeof(primary_desc);
+        if (FAILED(hr = IDirectDrawSurface7_GetSurfaceDesc(presenter->primary, &primary_desc)))
+            return hr;
+        if (!(info->lpHdr->biCompression == BI_RGB && info->lpHdr->biBitCount == 24)
+                && info->lpHdr->biBitCount != primary_desc.ddpfPixelFormat.dwRGBBitCount)
+            return E_FAIL;
+
+        if (info->lpHdr->biCompression == BI_RGB)
+        {
+            /* RGB24 is widened to RGB32 in vmr_render(). */
+            if (info->lpHdr->biBitCount != 32 && info->lpHdr->biBitCount != 24)
+            {
+                FIXME("Unhandled bit depth %u.\n", info->lpHdr->biBitCount);
+                return E_NOTIMPL;
+            }
+
+            surface_desc.ddpfPixelFormat.dwFlags = DDPF_RGB;
+            surface_desc.ddpfPixelFormat.dwRGBBitCount = 32;
+            surface_desc.ddpfPixelFormat.dwRBitMask = 0x00ff0000;
+            surface_desc.ddpfPixelFormat.dwGBitMask = 0x0000ff00;
+            surface_desc.ddpfPixelFormat.dwBBitMask = 0x000000ff;
+        }
+        else
+        {
+            mask = (DWORD *)((BITMAPINFO *)info->lpHdr)->bmiColors;
+            surface_desc.ddpfPixelFormat.dwFlags = DDPF_RGB;
+            surface_desc.ddpfPixelFormat.dwRGBBitCount = info->lpHdr->biBitCount;
+            surface_desc.ddpfPixelFormat.dwRBitMask = mask[0];
+            surface_desc.ddpfPixelFormat.dwGBitMask = mask[1];
+            surface_desc.ddpfPixelFormat.dwBBitMask = mask[2];
+        }
     }
     else
     {
@@ -257,7 +282,14 @@ static HRESULT WINAPI surface_allocator_PrepareSurface(IVMRSurfaceAllocator *ifa
 static HRESULT WINAPI surface_allocator_AdviseNotify(IVMRSurfaceAllocator *iface,
         IVMRSurfaceAllocatorNotify *notify)
 {
-    FIXME("iface %p, notify %p, stub!\n", iface, notify);
+    struct vmr7_presenter *presenter = impl_from_IVMRSurfaceAllocator(iface);
+    RECT rect = {0, 0, 0, 0};
+
+    TRACE("presenter %p, notify %p.\n", presenter, notify);
+
+    presenter->notify = notify;
+    IVMRSurfaceAllocatorNotify_SetDDrawDevice(notify, presenter->ddraw,
+            MonitorFromRect(&rect, MONITOR_DEFAULTTOPRIMARY));
     return S_OK;
 }
 

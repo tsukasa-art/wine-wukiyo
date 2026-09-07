@@ -25,6 +25,7 @@
 #include "wine/debug.h"
 #include "ntsecapi.h"
 #include "windows.h"
+#include "winternl.h"
 #include "wine/asm.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(msvcrt);
@@ -213,8 +214,6 @@ void* CDECL bsearch(const void *key, const void *base, size_t nmemb,
  */
 #ifdef __i386__
 
-# if defined(__GNUC__) || defined(__clang__)
-
 __ASM_GLOBAL_FUNC(_chkesp,
                   "jnz 1f\n\t"
                   "ret\n"
@@ -241,16 +240,6 @@ void CDECL chkesp_fail(void)
   ERR("Stack pointer incorrect after last function call - Bad prototype/spec entry?\n");
   DebugBreak();
 }
-
-# else  /* __GNUC__ || __clang__ */
-
-/**********************************************************************/
-
-void CDECL _chkesp(void)
-{
-}
-
-# endif  /* __GNUC__ || __clang__ */
 
 #endif  /* __i386__ */
 
@@ -421,6 +410,28 @@ int CDECL _resetstkoflw(void)
     int stack_addr;
     DWORD oldprot;
 
+#ifdef __arm64ec__
+    char enabled[2], alias[2];
+    if (GetEnvironmentVariableA( "ORRERY_ARM64EC_STACK_PROBE", enabled, sizeof(enabled) ) == 1 &&
+        enabled[0] == '1' &&
+        GetEnvironmentVariableA( "ORRERY_ARM64EC_DATA_ALIAS", alias, sizeof(alias) ) == 1 && alias[0] == '1')
+    {
+        MEMORY_BASIC_INFORMATION info;
+        ULONG guaranteed = NtCurrentTeb()->GuaranteedStackBytes;
+        ULONG_PTR guard;
+        volatile BYTE touched;
+        if (!VirtualQuery( &stack_addr, &info, sizeof(info) )) return 0;
+        /* Leave the live host page writable while VirtualProtect returns its
+         * results. Consume a lower guard after unwinding, moving StackLimit
+         * through the normal stack-fault path rather than editing the TEB. */
+        guard = ((ULONG_PTR)&stack_addr & ~(ULONG_PTR)16383) - max( guaranteed, 16384 );
+        if (guard <= (ULONG_PTR)info.AllocationBase + 16384) return 0;
+        if (!VirtualProtect( (void *)guard, 4096, PAGE_GUARD | PAGE_READWRITE, &oldprot )) return 0;
+        touched = *(volatile BYTE *)guard;
+        (void)touched;
+        return 1;
+    }
+#endif
     /* causes stack fault that updates NtCurrentTeb()->Tib.StackLimit */
     return VirtualProtect(&stack_addr, 1, PAGE_GUARD|PAGE_READWRITE, &oldprot);
 }

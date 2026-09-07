@@ -37,6 +37,8 @@ struct wayland process_wayland =
     .seat.mutex = PTHREAD_MUTEX_INITIALIZER,
     .keyboard.mutex = PTHREAD_MUTEX_INITIALIZER,
     .pointer.mutex = PTHREAD_MUTEX_INITIALIZER,
+    .text_input.mutex = PTHREAD_MUTEX_INITIALIZER,
+    .data_device.mutex = PTHREAD_MUTEX_INITIALIZER,
     .output_list = {&process_wayland.output_list, &process_wayland.output_list},
     .output_mutex = PTHREAD_MUTEX_INITIALIZER
 };
@@ -115,6 +117,7 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
     {
         process_wayland.wl_compositor =
             wl_registry_bind(registry, id, &wl_compositor_interface, 4);
+        wayland_window_init();
     }
     else if (strcmp(interface, "xdg_wm_base") == 0)
     {
@@ -139,10 +142,17 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
         }
         pthread_mutex_lock(&seat->mutex);
         seat->wl_seat = wl_registry_bind(registry, id, &wl_seat_interface,
-                                         version < 5 ? version : 5);
+                                         version < 8 ? version : 8);
         seat->global_id = id;
         wl_seat_add_listener(seat->wl_seat, &seat_listener, NULL);
         pthread_mutex_unlock(&seat->mutex);
+        if (process_wayland.zwp_text_input_manager_v3) wayland_text_input_init();
+        /* Recreate the data device for the new seat. */
+        if (process_wayland.data_device.zwlr_data_control_device_v1 ||
+            process_wayland.data_device.wl_data_device)
+        {
+            wayland_data_device_init();
+        }
     }
     else if (strcmp(interface, "wp_viewporter") == 0)
     {
@@ -163,6 +173,48 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
     {
         process_wayland.zwp_relative_pointer_manager_v1 =
             wl_registry_bind(registry, id, &zwp_relative_pointer_manager_v1_interface, 1);
+    }
+    else if (strcmp(interface, "zwp_text_input_manager_v3") == 0)
+    {
+        process_wayland.zwp_text_input_manager_v3 =
+            wl_registry_bind(registry, id, &zwp_text_input_manager_v3_interface, 1);
+        if (process_wayland.seat.wl_seat) wayland_text_input_init();
+    }
+    else if (strcmp(interface, "zwlr_data_control_manager_v1") == 0)
+    {
+        process_wayland.zwlr_data_control_manager_v1 =
+            wl_registry_bind(registry, id, &zwlr_data_control_manager_v1_interface, 1);
+    }
+    else if (strcmp(interface, "wl_data_device_manager") == 0)
+    {
+        process_wayland.wl_data_device_manager =
+            wl_registry_bind(registry, id, &wl_data_device_manager_interface, 2);
+    }
+    else if (strcmp(interface, "xdg_toplevel_icon_manager_v1") == 0)
+    {
+        process_wayland.xdg_toplevel_icon_manager_v1 =
+            wl_registry_bind(registry, id, &xdg_toplevel_icon_manager_v1_interface, 1);
+    }
+    else if (strcmp(interface, "wp_cursor_shape_manager_v1") == 0)
+    {
+        process_wayland.wp_cursor_shape_manager_v1 =
+            wl_registry_bind(registry, id, &wp_cursor_shape_manager_v1_interface,
+                             version < 2 ? version : 2);
+    }
+    else if (strcmp(interface, "wp_pointer_warp_v1") == 0)
+    {
+        process_wayland.wp_pointer_warp_v1 =
+            wl_registry_bind(registry, id, &wp_pointer_warp_v1_interface, 1);
+    }
+    else if (strcmp(interface, "wp_alpha_modifier_v1") == 0)
+    {
+        process_wayland.wp_alpha_modifier_v1 =
+            wl_registry_bind(registry, id, &wp_alpha_modifier_v1_interface, 1);
+    }
+    else if (strcmp(interface, "wp_fractional_scale_manager_v1") == 0)
+    {
+        process_wayland.wp_fractional_scale_manager_v1 =
+            wl_registry_bind(registry, id, &wp_fractional_scale_manager_v1_interface, 1);
     }
 }
 
@@ -189,6 +241,7 @@ static void registry_handle_global_remove(void *data, struct wl_registry *regist
     {
         TRACE("removing seat\n");
         if (process_wayland.pointer.wl_pointer) wayland_pointer_deinit();
+        if (process_wayland.text_input.zwp_text_input_v3) wayland_text_input_deinit();
         pthread_mutex_lock(&seat->mutex);
         wl_seat_release(seat->wl_seat);
         seat->wl_seat = NULL;
@@ -218,7 +271,12 @@ BOOL wayland_process_init(void)
 
     TRACE("wl_display=%p\n", process_wayland.wl_display);
 
+#if (WAYLAND_VERSION_MAJOR == 1 && WAYLAND_VERSION_MINOR >= 23)
+    if (!(process_wayland.wl_event_queue =
+          wl_display_create_queue_with_name(process_wayland.wl_display, process_name ? process_name : "winewayland")))
+#else
     if (!(process_wayland.wl_event_queue = wl_display_create_queue(process_wayland.wl_display)))
+#endif
     {
         ERR("Failed to create event queue\n");
         return FALSE;
@@ -281,6 +339,23 @@ BOOL wayland_process_init(void)
 
     if (!process_wayland.zwp_relative_pointer_manager_v1)
         ERR("Wayland compositor doesn't support optional zwp_relative_pointer_manager_v1 (relative motion won't work)\n");
+
+    if (!process_wayland.zwp_text_input_manager_v3)
+        ERR("Wayland compositor doesn't support optional zwp_text_input_manager_v3 (host input methods won't work)\n");
+
+    if (!process_wayland.zwlr_data_control_manager_v1)
+    {
+        if (!process_wayland.wl_data_device_manager)
+            ERR("Wayland compositor doesn't support optional wl_data_device_manager (clipboard won't work)\n");
+        else
+            ERR("Wayland compositor doesn't support optional zwlr_data_control_manager_v1 (clipboard functionality will be limited)\n");
+    }
+
+    if (!process_wayland.xdg_toplevel_icon_manager_v1)
+        ERR("Wayland compositor doesn't support xdg_toplevel_icon_manager_v1 (window icons will not be supported)\n");
+
+    if (!process_wayland.wp_fractional_scale_manager_v1)
+        ERR("Wayland compositor doesn't support wp_fractional_scale_manager_v1 (fractional scaling will be broken)\n");
 
     process_wayland.initialized = TRUE;
 

@@ -168,6 +168,16 @@ static inline void context_x64_to_arm( ARM64_NT_CONTEXT *arm_ctx, const ARM64EC_
     arm_ctx->Fpsr = fpcsr >> 32;
 }
 
+/* Contexts crossing from the ARM64EC x64 view into a syscall that may resume
+ * execution carry explicit guest-return provenance. Native ARM64 contexts do
+ * not receive this marker, even when their PC happens to be outside EC code. */
+static inline void context_x64_to_arm_guest_return( ARM64_NT_CONTEXT *arm_ctx,
+                                                    const ARM64EC_NT_CONTEXT *ec_ctx )
+{
+    context_x64_to_arm( arm_ctx, ec_ctx );
+    arm_ctx->ContextFlags |= CONTEXT_ARM64_RET_TO_GUEST;
+}
+
 static inline void context_arm_to_x64( ARM64EC_NT_CONTEXT *ec_ctx, const ARM64_NT_CONTEXT *arm_ctx )
 {
     memset( ec_ctx, 0, sizeof(*ec_ctx) );

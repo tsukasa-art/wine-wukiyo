@@ -22,7 +22,6 @@
 #include <setjmp.h>
 
 #include "ntstatus.h"
-#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winnt.h"
@@ -37,6 +36,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(wow);
 
 USHORT native_machine = 0;
 USHORT current_machine = 0;
+BOOL wow64_low_va_shadow = FALSE;
 ULONG_PTR args_alignment = 0;
 ULONG_PTR highest_user_address = 0x7ffeffff;
 ULONG_PTR default_zero_bits = 0x7fffffff;
@@ -92,6 +92,7 @@ struct user_apc_frame
 SYSTEM_DLL_INIT_BLOCK *pLdrSystemDllInitBlock = NULL;
 
 static WOW64INFO *wow64info;
+static WORD ss32_sel;
 
 /* cpu backend dll functions */
 /* the function prototypes most likely differ from Windows */
@@ -111,6 +112,7 @@ void     (WINAPI *pBTCpuNotifyMemoryAlloc)( void *, SIZE_T, ULONG, ULONG, BOOL, 
 void     (WINAPI *pBTCpuNotifyMemoryDirty)( void *, SIZE_T ) = NULL;
 void     (WINAPI *pBTCpuNotifyMemoryFree)( void *, SIZE_T, ULONG, BOOL, NTSTATUS ) = NULL;
 void     (WINAPI *pBTCpuNotifyMemoryProtect)( void *, SIZE_T, ULONG, BOOL, NTSTATUS ) = NULL;
+void     (WINAPI *pBTCpuNotifyProcessExecuteFlagsChange)(ULONG) = NULL;
 void     (WINAPI *pBTCpuNotifyReadFile)( HANDLE, void *, SIZE_T, BOOL, NTSTATUS ) = NULL;
 void     (WINAPI *pBTCpuNotifyUnmapViewOfSection)( void *, BOOL, NTSTATUS ) = NULL;
 NTSTATUS (WINAPI *pBTCpuResetToConsistentState)( EXCEPTION_POINTERS * ) = NULL;
@@ -124,7 +126,7 @@ BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, void *reserved )
     return TRUE;
 }
 
-void __cdecl __wine_spec_unimplemented_stub( const char *module, const char *function )
+void __cdecl DECLSPEC_NORETURN __wine_spec_unimplemented_stub( const char *module, const char *function )
 {
     EXCEPTION_RECORD record;
 
@@ -138,6 +140,13 @@ void __cdecl __wine_spec_unimplemented_stub( const char *module, const char *fun
     for (;;) RtlRaiseException( &record );
 }
 
+static void DECLSPEC_NORETURN stub_syscall( const char *name )
+{
+    __wine_spec_unimplemented_stub( "ntdll", name );
+}
+
+#define SYSCALL_STUB(name) NTSTATUS WINAPI wow64_ ## name( UINT *args ) { stub_syscall( #name ); }
+ALL_SYSCALL_STUBS
 
 static EXCEPTION_RECORD *exception_record_32to64( const EXCEPTION_RECORD32 *rec32 )
 {
@@ -147,8 +156,10 @@ static EXCEPTION_RECORD *exception_record_32to64( const EXCEPTION_RECORD32 *rec3
     rec = Wow64AllocateTemp( sizeof(*rec) );
     rec->ExceptionCode = rec32->ExceptionCode;
     rec->ExceptionFlags = rec32->ExceptionFlags;
-    rec->ExceptionRecord = rec32->ExceptionRecord ? exception_record_32to64( ULongToPtr(rec32->ExceptionRecord) ) : NULL;
-    rec->ExceptionAddress = ULongToPtr( rec32->ExceptionAddress );
+    rec->ExceptionRecord = rec32->ExceptionRecord
+                           ? exception_record_32to64( wow64_guest_memory_ptr( rec32->ExceptionRecord ))
+                           : NULL;
+    rec->ExceptionAddress = wow64_guest_memory_ptr( rec32->ExceptionAddress );
     rec->NumberParameters = rec32->NumberParameters;
     for (i = 0; i < EXCEPTION_MAXIMUM_PARAMETERS; i++)
         rec->ExceptionInformation[i] = rec32->ExceptionInformation[i];
@@ -162,8 +173,8 @@ static void exception_record_64to32( EXCEPTION_RECORD32 *rec32, const EXCEPTION_
 
     rec32->ExceptionCode    = rec->ExceptionCode;
     rec32->ExceptionFlags   = rec->ExceptionFlags;
-    rec32->ExceptionRecord  = PtrToUlong( rec->ExceptionRecord );
-    rec32->ExceptionAddress = PtrToUlong( rec->ExceptionAddress );
+    rec32->ExceptionRecord  = wow64_guest_memory_addr( rec->ExceptionRecord );
+    rec32->ExceptionAddress = wow64_guest_memory_addr( rec->ExceptionAddress );
     rec32->NumberParameters = rec->NumberParameters;
     for (i = 0; i < rec->NumberParameters; i++)
         rec32->ExceptionInformation[i] = rec->ExceptionInformation[i];
@@ -200,10 +211,13 @@ static void __attribute__((used)) call_user_exception_dispatcher( EXCEPTION_RECO
                 ULONG              context_ptr;   /* 004 */
                 EXCEPTION_RECORD32 rec;           /* 008 */
                 I386_CONTEXT       context;       /* 058 */
-            } *stack;
+            } *local;
             I386_CONTEXT ctx = { CONTEXT_I386_ALL };
             CONTEXT_EX *context_ex, *src_ex = NULL;
-            ULONG flags, context_length;
+            ULONG esp, flags, context_length;
+            ULONG guest_esp;
+            SIZE_T frame_size;
+            NTSTATUS status;
 
             C_ASSERT( offsetof(struct exc_stack_layout32, context) == 0x58 );
 
@@ -231,26 +245,44 @@ static void __attribute__((used)) call_user_exception_dispatcher( EXCEPTION_RECO
 
             RtlGetExtendedContextLength( flags, &context_length );
 
-            stack = (struct exc_stack_layout32 *)ULongToPtr( (ctx.Esp - offsetof(struct exc_stack_layout32, context) - context_length) & ~3 );
-            stack->rec_ptr     = PtrToUlong( &stack->rec );
-            stack->context_ptr = PtrToUlong( &stack->context );
-            stack->rec         = *rec;
-            stack->context     = ctx;
-            RtlInitializeExtendedContext( &stack->context, flags, &context_ex );
+            esp = LOWORD(ctx.SegSs) != ss32_sel ? NtCurrentTeb32()->SystemReserved1[0] : ctx.Esp;
+            frame_size = offsetof(struct exc_stack_layout32, context) + context_length;
+            if (frame_size > esp) RtlRaiseStatus( STATUS_STACK_OVERFLOW );
+            guest_esp = (esp - frame_size) & ~3u;
+            if (!(local = Wow64AllocateTemp( frame_size ))) RtlRaiseStatus( STATUS_NO_MEMORY );
+            memset( local, 0, frame_size );
+            local->rec_ptr = guest_esp + offsetof(struct exc_stack_layout32, rec);
+            local->context_ptr = guest_esp + offsetof(struct exc_stack_layout32, context);
+            local->rec = *rec;
+            local->context = ctx;
+            RtlInitializeExtendedContext( &local->context, flags, &context_ex );
             if (src_ex) RtlCopyExtendedContext( context_ex, WOW64_CONTEXT_XSTATE, src_ex );
 
             /* adjust Eip for breakpoints in software emulation (hardware exceptions already adjust Rip) */
             if (rec->ExceptionCode == EXCEPTION_BREAKPOINT && (wow64info->CpuFlags & WOW64_CPUFLAGS_SOFTWARE))
-                stack->context.Eip--;
+                local->context.Eip--;
 
-            ctx.Esp = PtrToUlong( stack );
+            status = __wine_wow64_user_copy( wow64_guest_memory_ptr( guest_esp ), local,
+                                              frame_size, WOW64_USER_COPY_FAULTING_WRITE );
+            if (status == STATUS_STACK_OVERFLOW)
+            {
+                /* The resolver has committed the guaranteed stack region.
+                 * Deliver the stack-overflow record through that region, as
+                 * virtual_setup_exception() does for a native stack fault. */
+                local->rec.ExceptionCode = STATUS_STACK_OVERFLOW;
+                local->rec.NumberParameters = 0;
+                status = __wine_wow64_user_copy( wow64_guest_memory_ptr( guest_esp ), local,
+                                                  frame_size, WOW64_USER_COPY_FAULTING_WRITE );
+            }
+            if (status) RtlRaiseStatus( status );
+            ctx.Esp = guest_esp;
             ctx.Eip = pLdrSystemDllInitBlock->pKiUserExceptionDispatcher;
             ctx.EFlags &= ~(0x100|0x400|0x40000);
             ctx.ContextFlags = CONTEXT_I386_CONTROL;
             pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
 
             TRACE( "exception %08lx dispatcher %08lx stack %08lx eip %08lx\n",
-                   rec->ExceptionCode, ctx.Eip, ctx.Esp, stack->context.Eip );
+                   rec->ExceptionCode, ctx.Eip, ctx.Esp, local->context.Eip );
         }
         break;
 
@@ -264,13 +296,13 @@ static void __attribute__((used)) call_user_exception_dispatcher( EXCEPTION_RECO
             ARM_CONTEXT ctx = { CONTEXT_ARM_ALL };
 
             pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
-            stack = (struct stack_layout *)(ULONG_PTR)(ctx.Sp & ~3) - 1;
+            stack = (struct stack_layout *)wow64_guest_memory_ptr( ctx.Sp & ~3 ) - 1;
             stack->rec = *rec;
             stack->context = ctx;
 
-            ctx.R0 = PtrToUlong( &stack->rec );     /* first arg for KiUserExceptionDispatcher */
-            ctx.R1 = PtrToUlong( &stack->context ); /* second arg for KiUserExceptionDispatcher */
-            ctx.Sp = PtrToUlong( stack );
+            ctx.R0 = wow64_guest_memory_addr( &stack->rec );     /* first arg for KiUserExceptionDispatcher */
+            ctx.R1 = wow64_guest_memory_addr( &stack->context ); /* second arg for KiUserExceptionDispatcher */
+            ctx.Sp = wow64_guest_memory_addr( stack );
             ctx.Pc = pLdrSystemDllInitBlock->pKiUserExceptionDispatcher;
             if (ctx.Pc & 1) ctx.Cpsr |= 0x20;
             else ctx.Cpsr &= ~0x20;
@@ -297,11 +329,16 @@ static void __attribute__((used)) call_raise_user_exception_dispatcher( ULONG co
     case IMAGE_FILE_MACHINE_I386:
         {
             I386_CONTEXT ctx;
+            ULONG guest_esp, return_address;
 
             ctx.ContextFlags = CONTEXT_I386_CONTROL;
             pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
-            ctx.Esp -= sizeof(ULONG);
-            *(ULONG *)ULongToPtr( ctx.Esp ) = ctx.Eip;
+            if (ctx.Esp < sizeof(ULONG)) RtlRaiseStatus( STATUS_STACK_OVERFLOW );
+            guest_esp = ctx.Esp - sizeof(ULONG);
+            return_address = ctx.Eip;
+            wow64_faulting_write_user( wow64_guest_memory_ptr( guest_esp ),
+                                        &return_address, sizeof(return_address) );
+            ctx.Esp = guest_esp;
             ctx.Eip = (ULONG_PTR)pKiRaiseUserExceptionDispatcher;
             pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
         }
@@ -455,6 +492,173 @@ NTSTATUS WINAPI wow64_NtAllocateUuids( UINT *args )
     return NtAllocateUuids( time, delta, sequence, seed );
 }
 
+/**********************************************************************
+ *           wow64_NtAlpcAcceptConnectPort
+ */
+NTSTATUS WINAPI wow64_NtAlpcAcceptConnectPort( UINT *args )
+{
+    ULONG *communication_port_ptr = get_ptr( &args );
+    HANDLE connection_port = get_handle( &args );
+    ULONG flags = get_ulong( &args );
+    OBJECT_ATTRIBUTES32 *attr32 = get_ptr( &args );
+    ALPC_PORT_ATTRIBUTES32 *port_attr32 = get_ptr( &args );
+    void *context = get_raw_ptr( &args );
+    ALPC_PORT_MESSAGE32 *msg32 = get_ptr( &args );
+    ALPC_MESSAGE_ATTRIBUTES32 *msg_attr32 = get_ptr( &args );
+    BOOLEAN accept = get_ulong( &args );
+    NTSTATUS status;
+
+    HANDLE communication_port = 0;
+    struct object_attr64 attr;
+    ALPC_PORT_ATTRIBUTES port_attr;
+    ALPC_PORT_MESSAGE *msg;
+    ALPC_MESSAGE_ATTRIBUTES *msg_attr;
+
+    status = NtAlpcAcceptConnectPort( communication_port_ptr ? &communication_port : NULL,
+                                      connection_port, flags, objattr_32to64( &attr, attr32 ),
+                                      alpc_port_attributes_32to64( &port_attr, port_attr32 ), context,
+                                      alpc_port_message_32to64( &msg, msg32 ? (sizeof(*msg) + msg32->DataLength) : 0, msg32, TRUE ),
+                                      alpc_port_message_attributes_32to64( &msg_attr, msg_attr32, TRUE ),
+                                      accept);
+    if (status == STATUS_SUCCESS && accept && communication_port_ptr)
+        put_handle( communication_port_ptr, communication_port );
+    return status;
+}
+
+/**********************************************************************
+ *           wow64_NtAlpcConnectPort
+ */
+NTSTATUS WINAPI wow64_NtAlpcConnectPort( UINT *args )
+{
+    ULONG *handle_ptr = get_ptr( &args );
+    UNICODE_STRING32 *str32 = get_ptr( &args );
+    OBJECT_ATTRIBUTES32 *attr32 = get_ptr( &args );
+    ALPC_PORT_ATTRIBUTES32 *port_attr32 = get_ptr( &args );
+    ULONG flags = get_ulong( &args );
+    SID *sid = get_ptr( &args );
+    ALPC_PORT_MESSAGE32 *msg32 = get_ptr( &args );
+    ULONG *size32 = get_ptr( &args );
+    ALPC_MESSAGE_ATTRIBUTES32 *send_msg_attr32 = get_ptr( &args );
+    ALPC_MESSAGE_ATTRIBUTES32 *recv_msg_attr32 = get_ptr( &args );
+    LARGE_INTEGER *timeout = get_ptr( &args );
+    NTSTATUS status;
+
+    HANDLE handle = 0;
+    UNICODE_STRING str;
+    struct object_attr64 attr;
+    ALPC_PORT_ATTRIBUTES port_attr;
+    ALPC_PORT_MESSAGE *msg;
+    SIZE_T size = size32 ? (*size32 + sizeof(ALPC_PORT_MESSAGE) - sizeof(ALPC_PORT_MESSAGE32)) : 65535;
+    ALPC_MESSAGE_ATTRIBUTES *send_msg_attr;
+    ALPC_MESSAGE_ATTRIBUTES *recv_msg_attr;
+
+    if (!handle_ptr) return STATUS_OBJECT_NAME_NOT_FOUND;
+
+    if (port_attr32 && (!port_attr32->MaxMessageLength
+                        || port_attr32->MaxMessageLength > (65535 - (sizeof(ALPC_PORT_MESSAGE) - sizeof(ALPC_PORT_MESSAGE32)))))
+        return STATUS_INVALID_PARAMETER;
+
+    status = NtAlpcConnectPort( &handle, unicode_str_32to64( &str, str32 ), objattr_32to64( &attr, attr32 ),
+                                alpc_port_attributes_32to64( &port_attr, port_attr32 ), flags, sid,
+                                alpc_port_message_32to64( &msg, size, msg32, TRUE ), &size,
+                                alpc_port_message_attributes_32to64( &send_msg_attr, send_msg_attr32, TRUE ),
+                                alpc_port_message_attributes_32to64( &recv_msg_attr, recv_msg_attr32, FALSE ), timeout);
+    if (status == STATUS_SUCCESS)
+    {
+        put_handle( handle_ptr, handle );
+        alpc_port_message_64to32( msg32, msg );
+        alpc_port_message_attributes_64to32( recv_msg_attr32, recv_msg_attr );
+    }
+    else if (status == STATUS_BUFFER_TOO_SMALL && size32)
+    {
+        put_size( size32, size - (sizeof(ALPC_PORT_MESSAGE) - sizeof(ALPC_PORT_MESSAGE32)));
+    }
+    return status;
+}
+
+/**********************************************************************
+ *           wow64_NtAlpcCreatePort
+ */
+NTSTATUS WINAPI wow64_NtAlpcCreatePort( UINT *args )
+{
+    ULONG *handle_ptr = get_ptr( &args );
+    OBJECT_ATTRIBUTES32 *attr32 = get_ptr( &args );
+    ALPC_PORT_ATTRIBUTES32 *port_attr32 = get_ptr( &args );
+    NTSTATUS status;
+
+    struct object_attr64 attr;
+    ALPC_PORT_ATTRIBUTES port_attr;
+    HANDLE handle = 0;
+
+    if (!handle_ptr) return STATUS_ACCESS_VIOLATION;
+
+    status = NtAlpcCreatePort( &handle, objattr_32to64( &attr, attr32 ),
+                               alpc_port_attributes_32to64( &port_attr, port_attr32 ) );
+    if (!status) put_handle( handle_ptr, handle );
+    return status;
+}
+
+/**********************************************************************
+ *           wow64_NtAlpcDisconnectPort
+ */
+NTSTATUS WINAPI wow64_NtAlpcDisconnectPort( UINT *args )
+{
+    HANDLE handle = get_handle( &args );
+    ULONG flags = get_ulong( &args );
+
+    return NtAlpcDisconnectPort( handle, flags );
+}
+
+/**********************************************************************
+ *           wow64_NtAlpcImpersonateClientOfPort
+ */
+NTSTATUS WINAPI wow64_NtAlpcImpersonateClientOfPort( UINT *args )
+{
+    HANDLE handle = get_handle( &args );
+    ALPC_PORT_MESSAGE32 *msg32 = get_ptr( &args );
+    void *reserved = get_raw_ptr( &args );
+
+    ALPC_PORT_MESSAGE *msg;
+
+    return NtAlpcImpersonateClientOfPort( handle, alpc_port_message_32to64( &msg, msg32 ? (sizeof(*msg) + msg32->DataLength) : 0, msg32, TRUE ), reserved );
+}
+
+/**********************************************************************
+ *           wow64_NtAlpcSendWaitReceivePort
+ */
+NTSTATUS WINAPI wow64_NtAlpcSendWaitReceivePort( UINT *args )
+{
+    HANDLE handle = get_handle( &args );
+    ULONG flags = get_ulong( &args );
+    ALPC_PORT_MESSAGE32 *send_msg32 = get_ptr( &args );
+    ALPC_MESSAGE_ATTRIBUTES32 *send_msg_attr32 = get_ptr( &args );
+    ALPC_PORT_MESSAGE32 *recv_msg32 = get_ptr( &args );
+    ULONG *size32 = get_ptr( &args );
+    ALPC_MESSAGE_ATTRIBUTES32 *recv_msg_attr32 = get_ptr( &args );
+    LARGE_INTEGER *timeout = get_ptr( &args );
+    NTSTATUS status;
+
+    ALPC_PORT_MESSAGE *send_msg;
+    ALPC_MESSAGE_ATTRIBUTES *send_msg_attr;
+    ALPC_PORT_MESSAGE *recv_msg;
+    ALPC_MESSAGE_ATTRIBUTES *recv_msg_attr;
+    SIZE_T size = size32 ? (*size32 + sizeof(ALPC_PORT_MESSAGE) - sizeof(ALPC_PORT_MESSAGE32)) : 65535;
+
+    status = NtAlpcSendWaitReceivePort( handle, flags, alpc_port_message_32to64( &send_msg, send_msg32 ? (sizeof(*send_msg) + send_msg32->DataLength) : 0, send_msg32, TRUE ),
+                                        alpc_port_message_attributes_32to64( &send_msg_attr, send_msg_attr32, TRUE ),
+                                        alpc_port_message_32to64( &recv_msg, size, recv_msg32, FALSE ), &size,
+                                        alpc_port_message_attributes_32to64( &recv_msg_attr, recv_msg_attr32, FALSE ), timeout );
+    if (status == STATUS_SUCCESS)
+    {
+        alpc_port_message_64to32( recv_msg32, recv_msg );
+        alpc_port_message_attributes_64to32( recv_msg_attr32, recv_msg_attr );
+    }
+    else if (status == STATUS_BUFFER_TOO_SMALL && size32)
+    {
+        put_size( size32, size - (sizeof(ALPC_PORT_MESSAGE) - sizeof(ALPC_PORT_MESSAGE32)) );
+    }
+    return status;
+}
 
 /***********************************************************************
  *           wow64_NtCallbackReturn
@@ -494,7 +698,9 @@ NTSTATUS WINAPI wow64_NtClose( UINT *args )
 NTSTATUS WINAPI wow64_NtContinueEx( UINT *args )
 {
     void *context = get_ptr( &args );
-    KCONTINUE_ARGUMENT *cont_args = get_ptr( &args );
+    ULONG cont_arg = get_ulong( &args );
+    KCONTINUE_ARGUMENT *cont_args = cont_arg > 0xff ?
+        wow64_guest_memory_ptr( cont_arg ) : wow64_raw_ptr32( cont_arg );
 
     NTSTATUS status = get_context_return_value( context );
     struct user_apc_frame *frame = NtCurrentTeb()->TlsSlots[WOW64_TLS_APCLIST];
@@ -701,7 +907,7 @@ void init_image_mapping( HMODULE module )
 {
     ULONG *ptr = RtlFindExportedRoutineByName( module, "Wow64Transition" );
 
-    if (ptr) *ptr = PtrToUlong( pBTCpuGetBopCode() );
+    if (ptr) *ptr = wow64_guest_memory_addr( pBTCpuGetBopCode() );
 }
 
 
@@ -784,8 +990,26 @@ static NTSTATUS create_cross_process_work_list( WOW64INFO *wow64info )
     size.QuadPart = map_size;
     status = NtCreateSection( &section, SECTION_ALL_ACCESS, NULL, &size, PAGE_READWRITE, SEC_COMMIT, 0 );
     if (status) return status;
-    status = NtMapViewOfSection( section, GetCurrentProcess(), (void **)&list, default_zero_bits, 0, NULL,
-                                 &map_size, ViewShare, MEM_TOP_DOWN, PAGE_READWRITE );
+    if (wow64_uses_low_va_shadow())
+    {
+        MEM_ADDRESS_REQUIREMENTS requirements =
+        {
+            (void *)(WINE_LOW_VA_SHADOW_BASE + 0x10000),
+            (void *)(WINE_LOW_VA_SHADOW_BASE + highest_user_address),
+            0
+        };
+        MEM_EXTENDED_PARAMETER parameters[2] = {0};
+
+        parameters[0].Type = MemExtendedParameterAddressRequirements;
+        parameters[0].Pointer = &requirements;
+        parameters[1].Type = WINE_MEM_EXTENDED_PARAMETER_WOW64_TRANSLATED;
+        status = NtMapViewOfSectionEx( section, GetCurrentProcess(), (void **)&list, NULL,
+                                       &map_size, MEM_TOP_DOWN, PAGE_READWRITE, parameters,
+                                       ARRAY_SIZE(parameters) );
+    }
+    else
+        status = NtMapViewOfSection( section, GetCurrentProcess(), (void **)&list, default_zero_bits,
+                                     0, NULL, &map_size, ViewShare, MEM_TOP_DOWN, PAGE_READWRITE );
     if (status)
     {
         NtClose( section );
@@ -821,6 +1045,9 @@ static DWORD WINAPI process_init( RTL_RUN_ONCE *once, void *param, void **contex
     highest_user_address = (ULONG_PTR)info.HighestUserAddress;
     default_zero_bits = (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
     NtQueryInformationProcess( GetCurrentProcess(), ProcessWow64Information, &peb32, sizeof(peb32), NULL );
+    wow64_low_va_shadow = current_machine == IMAGE_FILE_MACHINE_I386 &&
+                          (ULONG_PTR)peb32 >= WINE_LOW_VA_SHADOW_BASE &&
+                          (ULONG_PTR)peb32 - WINE_LOW_VA_SHADOW_BASE < WINE_LOW_VA_SHADOW_SIZE;
     wow64info = (WOW64INFO *)(peb32 + 1);
     wow64info->NativeSystemPageSize = 0x1000;
     wow64info->NativeMachineType    = native_machine;
@@ -848,6 +1075,7 @@ static DWORD WINAPI process_init( RTL_RUN_ONCE *once, void *param, void **contex
     GET_PTR( BTCpuNotifyMemoryDirty );
     GET_PTR( BTCpuNotifyMemoryFree );
     GET_PTR( BTCpuNotifyMemoryProtect );
+    GET_PTR( BTCpuNotifyProcessExecuteFlagsChange );
     GET_PTR( BTCpuNotifyReadFile );
     GET_PTR( BTCpuNotifyUnmapViewOfSection );
     GET_PTR( BTCpuUpdateProcessorInformation );
@@ -861,16 +1089,23 @@ static DWORD WINAPI process_init( RTL_RUN_ONCE *once, void *param, void **contex
 
     pBTCpuProcessInit();
 
-    module = (HMODULE)(ULONG_PTR)pLdrSystemDllInitBlock->ntdll_handle;
+    module = wow64_guest_memory_ptr( (ULONG)pLdrSystemDllInitBlock->ntdll_handle );
     init_image_mapping( module );
     GET_PTR( KiRaiseUserExceptionDispatcher );
     GET_PTR( __wine_syscall_dispatcher );
     GET_PTR( __wine_unix_call_dispatcher );
 
-    *p__wine_syscall_dispatcher = PtrToUlong( pBTCpuGetBopCode() );
-    *p__wine_unix_call_dispatcher = PtrToUlong( p__wine_get_unix_opcode() );
+    *p__wine_syscall_dispatcher = wow64_guest_memory_addr( pBTCpuGetBopCode() );
+    *p__wine_unix_call_dispatcher = wow64_guest_memory_addr( p__wine_get_unix_opcode() );
 
     if (wow64info->CpuFlags & WOW64_CPUFLAGS_SOFTWARE) create_cross_process_work_list( wow64info );
+
+    if (current_machine == IMAGE_FILE_MACHINE_I386)
+    {
+        I386_CONTEXT ctx = { CONTEXT_I386_CONTROL };
+        RtlWow64GetThreadContext( GetCurrentThread(), &ctx );
+        ss32_sel = ctx.SegSs;
+    }
 
     init_file_redirects();
     return TRUE;
@@ -884,7 +1119,7 @@ static DWORD WINAPI process_init( RTL_RUN_ONCE *once, void *param, void **contex
  */
 static void thread_init(void)
 {
-    NtCurrentTeb32()->WOW32Reserved = PtrToUlong( pBTCpuGetBopCode() );
+    NtCurrentTeb32()->WOW32Reserved = wow64_guest_memory_addr( pBTCpuGetBopCode() );
     NtCurrentTeb()->TlsSlots[WOW64_TLS_WOW64INFO] = wow64info;
     if (pBTCpuThreadInit) pBTCpuThreadInit();
 
@@ -893,19 +1128,26 @@ static void thread_init(void)
     {
     case IMAGE_FILE_MACHINE_I386:
         {
-            I386_CONTEXT *ctx_ptr, ctx = { CONTEXT_I386_FULL };
-            ULONG *stack;
+            struct init_stack_layout32
+            {
+                ULONG        return_address;
+                ULONG        context_ptr;
+                ULONG        unknown[3];
+                I386_CONTEXT context;
+            } local;
+            I386_CONTEXT ctx = { CONTEXT_I386_FULL };
+            ULONG guest_esp;
 
             pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
-            ctx_ptr = (I386_CONTEXT *)ULongToPtr( ctx.Esp ) - 1;
-            *ctx_ptr = ctx;
-            stack = (ULONG *)ctx_ptr;
-            *(--stack) = 0;
-            *(--stack) = 0;
-            *(--stack) = 0;
-            *(--stack) = PtrToUlong( ctx_ptr );
-            *(--stack) = 0xdeadbabe;
-            ctx.Esp = PtrToUlong( stack );
+            if (ctx.Esp < sizeof(local)) RtlRaiseStatus( STATUS_STACK_OVERFLOW );
+            guest_esp = ctx.Esp - sizeof(local);
+            memset( &local, 0, sizeof(local) );
+            local.return_address = 0xdeadbabe;
+            local.context_ptr = guest_esp + offsetof(struct init_stack_layout32, context);
+            local.context = ctx;
+            wow64_faulting_write_user( wow64_guest_memory_ptr( guest_esp ),
+                                        &local, sizeof(local) );
+            ctx.Esp = guest_esp;
             ctx.Eip = pLdrSystemDllInitBlock->pLdrInitializeThunk;
             pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
         }
@@ -916,11 +1158,11 @@ static void thread_init(void)
             ARM_CONTEXT *ctx_ptr, ctx = { CONTEXT_ARM_FULL };
 
             pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
-            ctx_ptr = (ARM_CONTEXT *)ULongToPtr( ctx.Sp & ~15 ) - 1;
+            ctx_ptr = (ARM_CONTEXT *)wow64_guest_memory_ptr( ctx.Sp & ~15 ) - 1;
             *ctx_ptr = ctx;
 
-            ctx.R0 = PtrToUlong( ctx_ptr );
-            ctx.Sp = PtrToUlong( ctx_ptr );
+            ctx.R0 = wow64_guest_memory_addr( ctx_ptr );
+            ctx.Sp = wow64_guest_memory_addr( ctx_ptr );
             ctx.Pc = pLdrSystemDllInitBlock->pLdrInitializeThunk;
             pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
         }
@@ -1017,8 +1259,16 @@ __ASM_GLOBAL_FUNC( wow64_syscall_handler,
  */
 NTSTATUS WINAPI Wow64SystemServiceEx( UINT num, UINT *args )
 {
+    union
+    {
+        ULONG64 align;
+        /* NtUserCreateWindowEx is currently the largest generated service
+         * frame (136 bytes); native ntdll tops out at 128. */
+        UINT args[34];
+    } snapshot;
     NTSTATUS status;
     UINT id = num & 0xfff;
+    BYTE args_size;
     const SYSTEM_SERVICE_TABLE *table = &syscall_tables[(num >> 12) & 3];
 
     if (id >= table->ServiceLimit)
@@ -1026,7 +1276,15 @@ NTSTATUS WINAPI Wow64SystemServiceEx( UINT num, UINT *args )
         ERR( "unsupported syscall %04x\n", num );
         return STATUS_INVALID_SYSTEM_SERVICE;
     }
-    status = wow64_syscall( args, table->ServiceTable[id] );
+    args_size = table->ArgumentTable[id];
+    if (args_size > sizeof(snapshot)) return STATUS_INVALID_PARAMETER;
+    if (args_size)
+    {
+        status = __wine_wow64_user_copy( snapshot.args, args, args_size,
+                                         WOW64_USER_COPY_READ );
+        if (status) return status;
+    }
+    status = wow64_syscall( snapshot.args, table->ServiceTable[id] );
     free_temp_data();
     return status;
 }
@@ -1105,8 +1363,10 @@ __ASM_GLOBAL_FUNC( cpu_simulate_handler,
 void * WINAPI Wow64AllocateTemp( SIZE_T size )
 {
     struct mem_header *mem;
+    const SIZE_T header_size = offsetof( struct mem_header, data );
 
-    if (!(mem = RtlAllocateHeap( GetProcessHeap(), 0, offsetof( struct mem_header, data[size] ))))
+    if (size > ~(SIZE_T)0 - header_size) return NULL;
+    if (!(mem = RtlAllocateHeap( GetProcessHeap(), 0, header_size + size )))
         return NULL;
     mem->next = NtCurrentTeb()->TlsSlots[WOW64_TLS_TEMPLIST];
     NtCurrentTeb()->TlsSlots[WOW64_TLS_TEMPLIST] = mem;
@@ -1141,29 +1401,36 @@ void WINAPI Wow64ApcRoutine( ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3, CON
                 I386_CONTEXT      context;       /* 014 */
                 CONTEXT_EX32      xctx;          /* 2e0 */
                 UINT              unk2[4];       /* 2f8 */
-            } *stack;
+            } local, *stack;
             I386_CONTEXT ctx = { CONTEXT_I386_FULL };
+            ULONG aligned_esp, guest_esp;
 
             C_ASSERT( offsetof(struct apc_stack_layout32, context) == 0x14 );
             C_ASSERT( sizeof(struct apc_stack_layout32) == 0x308 );
 
             pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
 
-            stack = (struct apc_stack_layout32 *)ULongToPtr( ctx.Esp & ~3 ) - 1;
-            stack->func      = arg1 >> 32;
-            stack->arg1      = arg1;
-            stack->arg2      = arg2;
-            stack->arg3      = arg3;
-            stack->alertable = TRUE;
-            stack->context   = ctx;
-            stack->xctx.Legacy.Offset = -(LONG)sizeof(stack->context);
-            stack->xctx.Legacy.Length = sizeof(stack->context);
-            stack->xctx.All.Offset    = -(LONG)sizeof(stack->context);
-            stack->xctx.All.Length    = sizeof(stack->context) + sizeof(stack->xctx);
-            stack->xctx.XState.Offset = 25;
-            stack->xctx.XState.Length = 0;
+            aligned_esp = ctx.Esp & ~3u;
+            if (aligned_esp < sizeof(local)) RtlRaiseStatus( STATUS_STACK_OVERFLOW );
+            guest_esp = aligned_esp - sizeof(local);
+            memset( &local, 0, sizeof(local) );
+            local.func      = arg1 >> 32;
+            local.arg1      = arg1;
+            local.arg2      = arg2;
+            local.arg3      = arg3;
+            local.alertable = TRUE;
+            local.context   = ctx;
+            local.xctx.Legacy.Offset = -(LONG)sizeof(local.context);
+            local.xctx.Legacy.Length = sizeof(local.context);
+            local.xctx.All.Offset    = -(LONG)sizeof(local.context);
+            local.xctx.All.Length    = sizeof(local.context) + sizeof(local.xctx);
+            local.xctx.XState.Offset = 25;
+            local.xctx.XState.Length = 0;
+            wow64_faulting_write_user( wow64_guest_memory_ptr( guest_esp ),
+                                        &local, sizeof(local) );
+            stack = wow64_guest_memory_ptr( guest_esp );
 
-            ctx.Esp = PtrToUlong( stack );
+            ctx.Esp = guest_esp;
             ctx.Eip = pLdrSystemDllInitBlock->pKiUserApcDispatcher;
             frame.wow_context = &stack->context;
             pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
@@ -1182,12 +1449,12 @@ void WINAPI Wow64ApcRoutine( ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3, CON
             ARM_CONTEXT ctx = { CONTEXT_ARM_FULL };
 
             pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
-            stack = (struct apc_stack_layout *)ULongToPtr( ctx.Sp & ~15 ) - 1;
+            stack = (struct apc_stack_layout *)wow64_guest_memory_ptr( ctx.Sp & ~15 ) - 1;
             stack->func = arg1 >> 32;
             stack->context = ctx;
-            ctx.Sp = PtrToUlong( stack );
+            ctx.Sp = wow64_guest_memory_addr( stack );
             ctx.Pc = pLdrSystemDllInitBlock->pKiUserApcDispatcher;
-            ctx.R0 = PtrToUlong( &stack->context );
+            ctx.R0 = wow64_guest_memory_addr( &stack->context );
             ctx.R1 = arg1;
             ctx.R2 = arg2;
             ctx.R3 = arg3;
@@ -1235,23 +1502,30 @@ NTSTATUS WINAPI Wow64KiUserCallbackDispatcher( ULONG id, void *args, ULONG len,
                 ULONG             unk[2];        /* 010 */
                 ULONG             esp;           /* 018 */
                 BYTE              args_data[0];  /* 01c */
-            } *stack;
+            } *local;
             I386_CONTEXT orig_ctx, ctx = { CONTEXT_I386_FULL };
+            SIZE_T frame_size;
+            ULONG guest_esp;
 
             C_ASSERT( sizeof(struct callback_stack_layout32) == 0x1c );
 
             pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
             orig_ctx = ctx;
 
-            stack = ULongToPtr( (ctx.Esp - offsetof(struct callback_stack_layout32,args_data[len])) & ~15 );
-            stack->eip  = ctx.Eip;
-            stack->id   = id;
-            stack->args = PtrToUlong( stack->args_data );
-            stack->len  = len;
-            stack->esp  = ctx.Esp;
-            memcpy( stack->args_data, args, len );
-
-            ctx.Esp = PtrToUlong( stack );
+            frame_size = offsetof(struct callback_stack_layout32, args_data) + len;
+            if (frame_size > ctx.Esp) RtlRaiseStatus( STATUS_STACK_OVERFLOW );
+            guest_esp = (ctx.Esp - frame_size) & ~15u;
+            if (!(local = Wow64AllocateTemp( frame_size ))) RtlRaiseStatus( STATUS_NO_MEMORY );
+            memset( local, 0, offsetof(struct callback_stack_layout32, args_data) );
+            local->eip  = ctx.Eip;
+            local->id   = id;
+            local->args = guest_esp + offsetof(struct callback_stack_layout32, args_data);
+            local->len  = len;
+            local->esp  = ctx.Esp;
+            if (len) memcpy( local->args_data, args, len );
+            wow64_faulting_write_user( wow64_guest_memory_ptr( guest_esp ),
+                                        local, frame_size );
+            ctx.Esp = guest_esp;
             ctx.Eip = pLdrSystemDllInitBlock->pKiUserCallbackDispatcher;
             pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
 
@@ -1270,13 +1544,13 @@ NTSTATUS WINAPI Wow64KiUserCallbackDispatcher( ULONG id, void *args, ULONG len,
             pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
             orig_ctx = ctx;
 
-            args_data = ULongToPtr( (ctx.Sp - len) & ~15 );
+            args_data = wow64_guest_memory_ptr( (ctx.Sp - len) & ~15 );
             memcpy( args_data, args, len );
 
             ctx.R0 = id;
-            ctx.R1 = PtrToUlong( args_data );
+            ctx.R1 = wow64_guest_memory_addr( args_data );
             ctx.R2 = len;
-            ctx.Sp = PtrToUlong( args_data );
+            ctx.Sp = wow64_guest_memory_addr( args_data );
             ctx.Pc = pLdrSystemDllInitBlock->pKiUserCallbackDispatcher;
             pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
 
@@ -1321,7 +1595,11 @@ __ASM_GLOBAL_FUNC( Wow64PrepareForException,
                    "je 1f\n\t"                   /* already in 64-bit mode? */
                    /* copy arguments to 64-bit stack */
                    "mov %rsp,%rsi\n\t"
-                   "mov 0x98(%rdx),%rcx\n\t"     /* context->Rsp */
+                   "movl $0x5c0,%ecx\n"          /* cf. KiUserExceptionDispatcher */
+                   "movl 0x4d4(%rdx),%edi\n\t"   /* context_ex->All.Length */
+                   "cmp %edi,%ecx\n\t"
+                   "cmovl %edi,%ecx\n\t"         /* max( 0x5c0, context_ex->All.Length ) */
+                   "add %rdx,%rcx\n\t"
                    "sub %rsi,%rcx\n\t"           /* stack size */
                    "sub %rcx,%r14\n\t"           /* reserve same size on 64-bit stack */
                    "and $~0x0f,%r14\n\t"

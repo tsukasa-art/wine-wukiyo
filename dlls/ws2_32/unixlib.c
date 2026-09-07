@@ -89,7 +89,6 @@
 #endif
 
 #include "ntstatus.h"
-#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winerror.h"
 #include "winternl.h"
@@ -1101,11 +1100,11 @@ struct WS_hostent32
 };
 
 static NTSTATUS put_addrinfo32( const struct WS_addrinfo *info, struct WS_addrinfo32 *info32,
-                                unsigned int *size )
+                                unsigned int *size, PTR32 guest_base )
 {
     struct WS_addrinfo32 *dst = info32, *prev = NULL;
     const struct WS_addrinfo *src;
-    unsigned int needed_size = 0;
+    SIZE_T needed_size = 0;
 
     for (src = info; src != NULL; src = src->ai_next)
     {
@@ -1114,6 +1113,7 @@ static NTSTATUS put_addrinfo32( const struct WS_addrinfo *info, struct WS_addrin
         needed_size += src->ai_addrlen;
     }
 
+    if (needed_size > 0xffffffffu) return WSAENOBUFS;
     if (*size < needed_size)
     {
         *size = needed_size;
@@ -1132,15 +1132,15 @@ static NTSTATUS put_addrinfo32( const struct WS_addrinfo *info, struct WS_addrin
         dst->ai_protocol = src->ai_protocol;
         if (src->ai_canonname)
         {
-            dst->ai_canonname = PtrToUlong( next );
+            dst->ai_canonname = guest_base + (ULONG)(next - (char *)info32);
             strcpy( next, src->ai_canonname );
             next += strlen(next) + 1;
         }
         dst->ai_addrlen = src->ai_addrlen;
-        dst->ai_addr = PtrToUlong(next);
+        dst->ai_addr = guest_base + (ULONG)((char *)next - (char *)info32);
         memcpy( next, src->ai_addr, dst->ai_addrlen );
         next += dst->ai_addrlen;
-        if (prev) prev->ai_next = PtrToUlong(dst);
+        if (prev) prev->ai_next = guest_base + (ULONG)((char *)dst - (char *)info32);
         prev = dst;
         dst = (struct WS_addrinfo32 *)next;
     }
@@ -1148,9 +1148,10 @@ static NTSTATUS put_addrinfo32( const struct WS_addrinfo *info, struct WS_addrin
 }
 
 static NTSTATUS put_hostent32( const struct WS_hostent *host, struct WS_hostent32 *host32,
-                               unsigned int *size )
+                               unsigned int *size, PTR32 guest_base )
 {
-    unsigned int needed_size = sizeof( struct WS_hostent32 ), alias_count = 0, addr_count = 0, i;
+    SIZE_T needed_size = sizeof( struct WS_hostent32 );
+    unsigned int alias_count = 0, addr_count = 0, i;
     char *p;
     ULONG *aliases, *addr_list;
 
@@ -1164,6 +1165,7 @@ static NTSTATUS put_hostent32( const struct WS_hostent *host, struct WS_hostent3
         needed_size += sizeof(ULONG) + host->h_length;
     needed_size += sizeof(ULONG); /* null terminator */
 
+    if (needed_size > 0xffffffffu) return WSAENOBUFS;
     if (*size < needed_size)
     {
         *size = needed_size;
@@ -1181,12 +1183,12 @@ static NTSTATUS put_hostent32( const struct WS_hostent *host, struct WS_hostent3
     addr_list = aliases + alias_count + 1;
     p = (char *)(addr_list + addr_count + 1);
 
-    host32->h_aliases = PtrToUlong( aliases );
-    host32->h_addr_list = PtrToUlong( addr_list );
+    host32->h_aliases = guest_base + (ULONG)((char *)aliases - (char *)host32);
+    host32->h_addr_list = guest_base + (ULONG)((char *)addr_list - (char *)host32);
 
     for (i = 0; i < addr_count; ++i)
     {
-        addr_list[i] = PtrToUlong( p );
+        addr_list[i] = guest_base + (ULONG)((char *)p - (char *)host32);
         memcpy( p, host->h_addr_list[i], host->h_length );
         p += host->h_length;
     }
@@ -1195,17 +1197,227 @@ static NTSTATUS put_hostent32( const struct WS_hostent *host, struct WS_hostent3
     {
         size_t len = strlen( host->h_aliases[i] ) + 1;
 
-        aliases[i] = PtrToUlong( p );
+        aliases[i] = guest_base + (ULONG)((char *)p - (char *)host32);
         memcpy( p, host->h_aliases[i], len );
         p += len;
     }
 
-    host32->h_name = PtrToUlong( p );
+    host32->h_name = guest_base + (ULONG)((char *)p - (char *)host32);
     strcpy( p, host->h_name );
     return STATUS_SUCCESS;
 }
 
 
+#if defined(__APPLE__) && defined(__aarch64__)
+/* Limited high-shadow WoW64 bridge. No guest pointer is passed to libc or
+ * retained across calls. Resolver results are flattened into caller memory. */
+#define WS32_BUFFER_LIMIT (1024u * 1024u)
+#define WS32_STRING_LIMIT 65536u
+struct ws32_gai { PTR32 node, service, hints, info, size; };
+struct ws32_hba { PTR32 addr; int len, family; PTR32 host, size; };
+struct ws32_hbn { PTR32 name, host, size; };
+struct ws32_hn { PTR32 name; unsigned int size; };
+struct ws32_ni { PTR32 addr; int addr_len; PTR32 host; DWORD host_len; PTR32 serv; DWORD serv_len; int flags; };
+
+static NTSTATUS ws32_pointer( PTR32 guest, SIZE_T size, void **host )
+{
+    if (!guest || size > 0x100000000ull - guest) return WSAEFAULT;
+    if (ntdll_wow64_guest32_to_host( guest, host )) return WSAEFAULT;
+    return 0;
+}
+
+static NTSTATUS ws32_read( void *dst, PTR32 guest, SIZE_T size )
+{
+    void *host;
+    if (ws32_pointer( guest, size, &host ) || ntdll_wow64_copy_from_user( dst, host, size ))
+        return WSAEFAULT;
+    return 0;
+}
+
+static NTSTATUS ws32_string( PTR32 guest, char **out )
+{
+    unsigned int used = 0;
+    char *copy;
+    *out = NULL;
+    if (!guest) return 0;
+    if (!(copy = malloc( WS32_STRING_LIMIT ))) return WSAENOBUFS;
+    while (used < WS32_STRING_LIMIT)
+    {
+        unsigned int count = min( 4096 - ((guest + used) & 4095), WS32_STRING_LIMIT - used );
+        if ((UINT64)guest + used + count > 0x100000000ull || ws32_read( copy + used, guest + used, count ))
+        { free( copy ); return WSAEFAULT; }
+        if (memchr( copy + used, 0, count )) { *out = copy; return 0; }
+        used += count;
+    }
+    free( copy );
+    return WSAEINVAL;
+}
+
+/* Probe every output before publication. Overlapping outputs have no useful
+ * representation in this ABI and are rejected without publishing either. */
+static NTSTATUS ws32_publish( PTR32 first, const void *data, unsigned int bytes,
+                              PTR32 second, const void *data2, unsigned int bytes2 )
+{
+    struct ntdll_wow64_user_write_range ranges[2];
+    unsigned int count = 0;
+    if (bytes && bytes2 && (UINT64)first < (UINT64)second + bytes2 &&
+        (UINT64)second < (UINT64)first + bytes) return WSAEFAULT;
+    if (bytes)
+    {
+        if (ws32_pointer( first, bytes, &ranges[count].dst )) return WSAEFAULT;
+        ranges[count].src = data; ranges[count++].size = bytes;
+    }
+    if (bytes2)
+    {
+        if (ws32_pointer( second, bytes2, &ranges[count].dst )) return WSAEFAULT;
+        ranges[count].src = data2; ranges[count++].size = bytes2;
+    }
+    if (ntdll_wow64_atomic_writev( ranges, count )) return WSAEFAULT;
+    return 0;
+}
+
+static NTSTATUS ws32_capacity( PTR32 size, unsigned int *capacity )
+{
+    void *host;
+    if (ws32_read( capacity, size, sizeof(*capacity) ) ||
+        ws32_pointer( size, sizeof(*capacity), &host ) ||
+        ntdll_wow64_probe_user_write( host, sizeof(*capacity) )) return WSAEFAULT;
+    if (*capacity > WS32_BUFFER_LIMIT) return WSAENOBUFS;
+    return 0;
+}
+
+static NTSTATUS ws32_result( const void *native, BOOL hostent, PTR32 guest,
+                             PTR32 guest_size, unsigned int capacity )
+{
+    unsigned int needed = 0;
+    NTSTATUS status;
+    void *flat;
+    status = hostent ? put_hostent32( native, NULL, &needed, guest ) :
+                       put_addrinfo32( native, NULL, &needed, guest );
+    if (status != ERROR_INSUFFICIENT_BUFFER) return status ? status : WSAEINVAL;
+    if (needed > WS32_BUFFER_LIMIT) return WSAENOBUFS;
+    if (capacity < needed)
+    {
+        status = ws32_publish( guest_size, &needed, sizeof(needed), 0, NULL, 0 );
+        return status ? status : ERROR_INSUFFICIENT_BUFFER;
+    }
+    if ((UINT64)guest + needed > 0x100000000ull || !guest) return WSAEFAULT;
+    if (!(flat = malloc( needed ))) return WSAENOBUFS;
+    status = hostent ? put_hostent32( native, flat, &needed, guest ) :
+                       put_addrinfo32( native, flat, &needed, guest );
+    if (!status) status = ws32_publish( guest, flat, needed, guest_size, &needed, sizeof(needed) );
+    free( flat );
+    return status;
+}
+
+static NTSTATUS wow64_unix_getaddrinfo( void *args )
+{
+    const struct ws32_gai *a = args;
+    struct WS_addrinfo hints = {0};
+    struct WS_addrinfo32 h;
+    struct getaddrinfo_params p = {0};
+    unsigned int capacity, native_size = WS32_BUFFER_LIMIT;
+    char *node = NULL, *service = NULL;
+    NTSTATUS status;
+    if ((status = ws32_capacity( a->size, &capacity ))) return status;
+    if ((status = ws32_string( a->node, &node )) ||
+        (status = ws32_string( a->service, &service ))) goto done;
+    if (a->hints)
+    {
+        if ((status = ws32_read( &h, a->hints, sizeof(h) ))) goto done;
+        hints.ai_flags = h.ai_flags; hints.ai_family = h.ai_family;
+        hints.ai_socktype = h.ai_socktype; hints.ai_protocol = h.ai_protocol;
+        p.hints = &hints;
+    }
+    p.node = node; p.service = service; p.size = &native_size;
+    if (!(p.info = malloc( native_size ))) { status = WSAENOBUFS; goto done; }
+    status = unix_getaddrinfo( &p );
+    if (!status) status = ws32_result( p.info, FALSE, a->info, a->size, capacity );
+    else if (status == ERROR_INSUFFICIENT_BUFFER) status = WSAENOBUFS;
+    free( p.info );
+done:
+    free( node ); free( service );
+    return status;
+}
+
+static NTSTATUS wow64_unix_gethostbyaddr( void *args )
+{
+    const struct ws32_hba *a = args;
+    struct gethostbyaddr_params p;
+    unsigned char address[16];
+    unsigned int capacity, native_size = WS32_BUFFER_LIMIT;
+    NTSTATUS status;
+    if ((a->family != WS_AF_INET || a->len != 4) &&
+        (a->family != WS_AF_INET6 || a->len != 16)) return WSAEINVAL;
+    if ((status = ws32_capacity( a->size, &capacity )) ||
+        (status = ws32_read( address, a->addr, a->len ))) return status;
+    p.addr = address; p.len = a->len; p.family = a->family; p.size = &native_size;
+    if (!(p.host = malloc( native_size ))) return WSAENOBUFS;
+    status = unix_gethostbyaddr( &p );
+    if (!status) status = ws32_result( p.host, TRUE, a->host, a->size, capacity );
+    else if (status == ERROR_INSUFFICIENT_BUFFER) status = WSAENOBUFS;
+    free( p.host );
+    return status;
+}
+
+static NTSTATUS wow64_unix_gethostbyname( void *args )
+{
+    const struct ws32_hbn *a = args;
+    struct gethostbyname_params p;
+    unsigned int capacity, native_size = WS32_BUFFER_LIMIT;
+    char *name = NULL;
+    NTSTATUS status;
+    if ((status = ws32_capacity( a->size, &capacity )) ||
+        (status = ws32_string( a->name, &name ))) return status;
+    if (!name) return WSAEFAULT;
+    p.name = name; p.size = &native_size;
+    if (!(p.host = malloc( native_size ))) { free( name ); return WSAENOBUFS; }
+    status = unix_gethostbyname( &p );
+    if (!status) status = ws32_result( p.host, TRUE, a->host, a->size, capacity );
+    else if (status == ERROR_INSUFFICIENT_BUFFER) status = WSAENOBUFS;
+    free( p.host ); free( name );
+    return status;
+}
+
+static NTSTATUS wow64_unix_gethostname( void *args )
+{
+    const struct ws32_hn *a = args;
+    struct gethostname_params p;
+    NTSTATUS status;
+    if (!a->size) return WSAEFAULT;
+    if (a->size > WS32_BUFFER_LIMIT) return WSAENOBUFS;
+    if (!(p.name = calloc( 1, a->size ))) return WSAENOBUFS;
+    p.size = a->size;
+    status = unix_gethostname( &p );
+    if (!status && !memchr( p.name, 0, a->size )) status = WSAEFAULT;
+    if (!status) status = ws32_publish( a->name, p.name, strlen( p.name ) + 1, 0, NULL, 0 );
+    free( p.name );
+    return status;
+}
+
+static NTSTATUS wow64_unix_getnameinfo( void *args )
+{
+    const struct ws32_ni *a = args;
+    struct WS_sockaddr_storage address;
+    struct getnameinfo_params p = {0};
+    NTSTATUS status;
+    if (a->addr_len < sizeof(struct WS_sockaddr) || a->addr_len > sizeof(address)) return WSAEFAULT;
+    if (a->host_len > WS32_BUFFER_LIMIT || a->serv_len > WS32_BUFFER_LIMIT) return WSAENOBUFS;
+    if ((status = ws32_read( &address, a->addr, a->addr_len ))) return status;
+    p.addr = (const struct WS_sockaddr *)&address; p.addr_len = a->addr_len; p.flags = a->flags;
+    p.host_len = a->host_len; p.serv_len = a->serv_len;
+    if (a->host_len && (!a->host || !(p.host = calloc( 1, a->host_len )))) return a->host ? WSAENOBUFS : WSAEFAULT;
+    if (a->serv_len && (!a->serv || !(p.serv = calloc( 1, a->serv_len ))))
+    { free( p.host ); return a->serv ? WSAENOBUFS : WSAEFAULT; }
+    status = unix_getnameinfo( &p );
+    if (!status && ((p.host && !memchr( p.host, 0, p.host_len )) ||
+                    (p.serv && !memchr( p.serv, 0, p.serv_len )))) status = WSAEFAULT;
+    if (!status) status = ws32_publish( a->host, p.host, p.host ? strlen( p.host ) + 1 : 0,
+                                       a->serv, p.serv, p.serv ? strlen( p.serv ) + 1 : 0 );
+    free( p.host ); free( p.serv );
+    return status;
+}
+#else
 static NTSTATUS wow64_unix_getaddrinfo( void *args )
 {
     struct
@@ -1240,7 +1452,7 @@ static NTSTATUS wow64_unix_getaddrinfo( void *args )
 
     if (!(params.info = malloc( *params.size ))) return WSAENOBUFS;
     status = unix_getaddrinfo( &params );
-    if (!status) put_addrinfo32( params.info, ULongToPtr(params32->info), ULongToPtr(params32->size) );
+    if (!status) put_addrinfo32( params.info, ULongToPtr(params32->info), ULongToPtr(params32->size), params32->info );
     free( params.info );
     return status;
 }
@@ -1270,7 +1482,7 @@ static NTSTATUS wow64_unix_gethostbyaddr( void *args )
     if (!(params.host = malloc( *params.size ))) return WSAENOBUFS;
     status = unix_gethostbyaddr( &params );
     if (!status)
-        status = put_hostent32( params.host, ULongToPtr(params32->host), ULongToPtr(params32->size) );
+        status = put_hostent32( params.host, ULongToPtr(params32->host), ULongToPtr(params32->size), params32->host );
     free( params.host );
     return status;
 }
@@ -1296,7 +1508,7 @@ static NTSTATUS wow64_unix_gethostbyname( void *args )
     if (!(params.host = malloc( *params.size ))) return WSAENOBUFS;
     status = unix_gethostbyname( &params );
     if (!status)
-        status = put_hostent32( params.host, ULongToPtr(params32->host), ULongToPtr(params32->size) );
+        status = put_hostent32( params.host, ULongToPtr(params32->host), ULongToPtr(params32->size), params32->host );
     free( params.host );
     return status;
 }
@@ -1344,6 +1556,8 @@ static NTSTATUS wow64_unix_getnameinfo( void *args )
     return unix_getnameinfo( &params );
 }
 
+#endif
+
 const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
 {
     wow64_unix_getaddrinfo,
@@ -1352,6 +1566,19 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     wow64_unix_gethostname,
     wow64_unix_getnameinfo,
 };
+
+#if defined(__APPLE__) && defined(__aarch64__)
+static const struct wine_unixlib_dispatch_entry_v2 ws32_entries[] =
+{
+    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct ws32_gai, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED | WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct ws32_hba, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED | WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct ws32_hbn, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED | WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct ws32_hn, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED | WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
+    WINE_UNIXLIB_DISPATCH_ARGS_V2( struct ws32_ni, WINE_UNIXLIB_DISPATCH_ENTRY_NESTED | WINE_UNIXLIB_DISPATCH_ENTRY_HAS_OUTPUT ),
+};
+WINE_UNIXLIB_DISPATCH_SOURCE_V2( __wine_unix_call_wow64_funcs, ws32_entries );
+C_ASSERT( ARRAYSIZE(ws32_entries) == ws_unix_funcs_count );
+#endif
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == ws_unix_funcs_count );
 

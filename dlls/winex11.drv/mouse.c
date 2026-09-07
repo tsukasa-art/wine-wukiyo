@@ -40,7 +40,6 @@ static void *xcursor_handle;
 # define MAKE_FUNCPTR(f) static typeof(f) * p##f
 MAKE_FUNCPTR(XcursorImageCreate);
 MAKE_FUNCPTR(XcursorImageDestroy);
-MAKE_FUNCPTR(XcursorImageLoadCursor);
 MAKE_FUNCPTR(XcursorImagesCreate);
 MAKE_FUNCPTR(XcursorImagesDestroy);
 MAKE_FUNCPTR(XcursorImagesLoadCursor);
@@ -155,7 +154,6 @@ void X11DRV_Xcursor_Init(void)
 
     LOAD_FUNCPTR(XcursorImageCreate);
     LOAD_FUNCPTR(XcursorImageDestroy);
-    LOAD_FUNCPTR(XcursorImageLoadCursor);
     LOAD_FUNCPTR(XcursorImagesCreate);
     LOAD_FUNCPTR(XcursorImagesDestroy);
     LOAD_FUNCPTR(XcursorImagesLoadCursor);
@@ -194,7 +192,7 @@ static Cursor get_empty_cursor(void)
 /***********************************************************************
  *		set_window_cursor
  */
-void set_window_cursor( Window window, HCURSOR handle )
+static void set_window_cursor( Window window, HCURSOR handle )
 {
     Cursor cursor, prev;
 
@@ -535,24 +533,14 @@ static void map_event_coords( HWND hwnd, Window window, Window event_root, int x
  */
 static void send_mouse_input( HWND hwnd, Window window, unsigned int state, INPUT *input )
 {
-    struct x11drv_win_data *data;
+    struct x11drv_thread_data *thread_data = x11drv_thread_data();
 
-    input->type = INPUT_MOUSE;
-
-    if (!hwnd)
-    {
-        struct x11drv_thread_data *thread_data = x11drv_thread_data();
-        if (!thread_data->clipping_cursor || thread_data->clip_window != window) return;
-        NtUserSendHardwareInput( hwnd, 0, input, 0 );
-        return;
-    }
-
-    if (!(data = get_win_data( hwnd ))) return;
-    release_win_data( data );
+    /* ignore clipping window input when not clipping or wrong clipping window */
+    if (!hwnd && (!thread_data->clipping_cursor || thread_data->clip_window != window)) return;
 
     /* update the wine server Z-order */
 
-    if (hwnd != x11drv_thread_data()->grab_hwnd &&
+    if (hwnd && hwnd != NtUserGetAncestor( get_capture_window(), GA_ROOT ) &&
         /* ignore event if a button is pressed, since the mouse is then grabbed too */
         !(state & (Button1Mask|Button2Mask|Button3Mask|Button4Mask|Button5Mask|Button6Mask|Button7Mask)))
     {
@@ -567,6 +555,7 @@ static void send_mouse_input( HWND hwnd, Window window, unsigned int state, INPU
         SERVER_END_REQ;
     }
 
+    input->type = INPUT_MOUSE;
     NtUserSendHardwareInput( hwnd, 0, input, 0 );
 }
 
@@ -909,7 +898,7 @@ static int fallback_cmp( const void *key, const void *member )
 
 static int find_fallback_shape( const char *name )
 {
-    struct cursor_font_fallback *fallback;
+    const struct cursor_font_fallback *fallback;
 
     if ((fallback = bsearch( name, fallbacks, ARRAY_SIZE( fallbacks ),
                              sizeof(*fallback), fallback_cmp )))
@@ -1387,7 +1376,7 @@ BOOL X11DRV_SetCursorPos( INT x, INT y )
 
     if (keyboard_grabbed)
     {
-        WARN( "refusing to warp to %u, %u\n", (int)pos.x, (int)pos.y );
+        WARN( "refusing to warp to %u, %u\n", pos.x, pos.y );
         return FALSE;
     }
 
@@ -1396,7 +1385,7 @@ BOOL X11DRV_SetCursorPos( INT x, INT y )
                       PointerMotionMask | ButtonPressMask | ButtonReleaseMask,
                       GrabModeAsync, GrabModeAsync, None, None, CurrentTime ) != GrabSuccess)
     {
-        WARN( "refusing to warp pointer to %u, %u without exclusive grab\n", (int)pos.x, (int)pos.y );
+        WARN( "refusing to warp pointer to %u, %u without exclusive grab\n", pos.x, pos.y );
         return FALSE;
     }
 
@@ -1438,8 +1427,8 @@ BOOL X11DRV_GetCursorPos(LPPOINT pos)
  */
 BOOL X11DRV_ClipCursor( const RECT *clip, BOOL reset )
 {
-    if (!reset && clip && grab_clipping_window( clip )) return TRUE;
-    ungrab_clipping_window();
+    if (reset || !clip || !grab_clipping_window( clip )) ungrab_clipping_window();
+    XFlush( x11drv_thread_data()->display );
     return TRUE;
 }
 
@@ -1534,6 +1523,7 @@ BOOL X11DRV_ButtonPress( HWND hwnd, XEvent *xev )
 {
     XButtonEvent *event = &xev->xbutton;
     int buttonNum = event->button - 1;
+    struct x11drv_win_data *data;
     INPUT input;
 
     if (buttonNum >= NB_BUTTONS) return FALSE;
@@ -1547,7 +1537,12 @@ BOOL X11DRV_ButtonPress( HWND hwnd, XEvent *xev )
     input.mi.time        = EVENT_x11_time_to_win32_time( event->time );
     input.mi.dwExtraInfo = 0;
 
-    update_user_time( event->time );
+    if ((data = get_win_data( hwnd )))
+    {
+        window_set_user_time( data, event->time, FALSE );
+        release_win_data( data );
+    }
+
     map_event_coords( hwnd, event->window, event->root, event->x_root, event->y_root, &input );
     send_mouse_input( hwnd, event->window, event->state, &input );
     return TRUE;
@@ -1598,7 +1593,7 @@ BOOL X11DRV_MotionNotify( HWND hwnd, XEvent *xev )
     input.mi.time        = EVENT_x11_time_to_win32_time( event->time );
     input.mi.dwExtraInfo = 0;
 
-    if (!hwnd && is_old_motion_event( event->serial ))
+    if (is_old_motion_event( event->serial ))
     {
         TRACE( "pos %d,%d old serial %lu, ignoring\n", event->x, event->y, event->serial );
         return FALSE;
@@ -1621,7 +1616,7 @@ BOOL X11DRV_EnterNotify( HWND hwnd, XEvent *xev )
 
     x11drv_thread_data()->keymapnotify_hwnd = hwnd;
 
-    if (hwnd == x11drv_thread_data()->grab_hwnd) return FALSE;
+    if (hwnd == NtUserGetAncestor( get_capture_window(), GA_ROOT )) return FALSE;
 
     /* simulate a mouse motion event */
     input.mi.dx          = event->x;
@@ -1697,7 +1692,7 @@ static BOOL map_raw_event_coords( XIRawEvent *event, INPUT *input )
     input->mi.dy = round( y->value );
 
     TRACE( "event %f,%f value %f,%f input %d,%d\n", x_value, y_value, x->value, y->value,
-           (int)input->mi.dx, (int)input->mi.dy );
+           input->mi.dx, input->mi.dy );
 
     x->value -= input->mi.dx;
     y->value -= input->mi.dy;
@@ -1757,15 +1752,15 @@ static BOOL X11DRV_TouchEvent( HWND hwnd, XGenericEventCookie *xev )
     case XI_TouchBegin:
         input.hi.uMsg = WM_POINTERDOWN;
         flags |= POINTER_MESSAGE_FLAG_NEW;
-        TRACE("XI_TouchBegin detail %u pos %dx%d, flags %#x\n", event->detail, (int)pos.x, (int)pos.y, flags);
+        TRACE("XI_TouchBegin detail %u pos %dx%d, flags %#x\n", event->detail, pos.x, pos.y, flags);
         break;
     case XI_TouchEnd:
         input.hi.uMsg = WM_POINTERUP;
-        TRACE("XI_TouchEnd detail %u pos %dx%d, flags %#x\n", event->detail, (int)pos.x, (int)pos.y, flags);
+        TRACE("XI_TouchEnd detail %u pos %dx%d, flags %#x\n", event->detail, pos.x, pos.y, flags);
         break;
     case XI_TouchUpdate:
         input.hi.uMsg = WM_POINTERUPDATE;
-        TRACE("XI_TouchUpdate detail %u pos %dx%d, flags %#x\n", event->detail, (int)pos.x, (int)pos.y, flags);
+        TRACE("XI_TouchUpdate detail %u pos %dx%d, flags %#x\n", event->detail, pos.x, pos.y, flags);
         break;
     }
 

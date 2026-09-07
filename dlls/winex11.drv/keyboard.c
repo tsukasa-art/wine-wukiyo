@@ -36,9 +36,15 @@
 #include <X11/Xutil.h>
 #include <X11/XKBlib.h>
 
+#ifdef SONAME_LIBXKBREGISTRY
+#include <xkbcommon/xkbregistry.h>
+#endif
+
 #include <ctype.h>
 #include <stdarg.h>
 #include <string.h>
+
+#include <dlfcn.h>
 
 #include "x11drv.h"
 
@@ -49,6 +55,7 @@
 #include "kbd.h"
 #include "wine/server.h"
 #include "wine/debug.h"
+#include "wine/list.h"
 
 /* log format (add 0-padding as appropriate):
     keycode  %u  as in output from xev
@@ -59,6 +66,18 @@
 WINE_DEFAULT_DEBUG_CHANNEL(keyboard);
 WINE_DECLARE_DEBUG_CHANNEL(key);
 
+struct layout
+{
+    struct list entry;
+
+    int xkb_group;
+    char *xkb_layout;
+
+    LANGID lang;
+    DWORD klid;
+    WORD layout_id;
+};
+
 static const unsigned int ControlMask = 1 << 2;
 
 static int min_keycode, max_keycode, keysyms_per_keycode;
@@ -67,8 +86,96 @@ static WORD keyc2vkey[256], keyc2scan[256];
 static int NumLockMask, ScrollLockMask, AltGrMask; /* mask in the XKeyEvent state */
 
 static pthread_mutex_t kbd_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct list xkb_layouts = LIST_INIT( xkb_layouts );
 
 static char KEYBOARD_MapDeadKeysym(KeySym keysym);
+
+static const WCHAR keyboard_layouts_keyW[] =
+{
+    '\\','R','e','g','i','s','t','r','y',
+    '\\','M','a','c','h','i','n','e',
+    '\\','S','y','s','t','e','m',
+    '\\','C','u','r','r','e','n','t','C','o','n','t','r','o','l','S','e','t',
+    '\\','C','o','n','t','r','o','l',
+    '\\','K','e','y','b','o','a','r','d',' ','L','a','y','o','u','t','s'
+};
+
+static ULONG query_reg_ascii_value( HKEY hkey, const char *name, KEY_VALUE_PARTIAL_INFORMATION *info, ULONG size )
+{
+    WCHAR nameW[64];
+
+    asciiz_to_unicode( nameW, name );
+    return query_reg_value( hkey, nameW, info, size );
+}
+
+static WORD get_layout_id_from_klid( DWORD klid )
+{
+    static WORD next_layout_id = 0x100;
+
+    char buffer[2048];
+    KEY_VALUE_PARTIAL_INFORMATION *value = (KEY_VALUE_PARTIAL_INFORMATION *)buffer;
+    WORD layout_id = 0;
+    HKEY hkey = NULL, subkey;
+    WCHAR name[16];
+
+    TRACE( "klid %08x\n", klid );
+
+    if (!HIWORD(klid)) return 0;
+    if (klid == -1) goto done;
+
+    snprintf( buffer, sizeof(buffer), "%08x", klid );
+    asciiz_to_unicode( name, buffer );
+
+    if (!(hkey = reg_open_key( NULL, keyboard_layouts_keyW, sizeof(keyboard_layouts_keyW) ))) goto done;
+
+    if (!(subkey = reg_open_key( hkey, name, 8 * sizeof(WCHAR) ))) goto done;
+
+    if (query_reg_ascii_value( subkey, "Layout Id", value, sizeof(buffer) ) && value->Type == REG_SZ)
+        layout_id = wcstoul( (const WCHAR *)value->Data, NULL, 16 );
+    NtClose( subkey );
+
+done:
+    if (hkey) NtClose( hkey );
+    if (!layout_id) layout_id = next_layout_id++;
+    TRACE( "layout_id %04x\n", layout_id );
+    return layout_id;
+}
+
+static void create_layout_from_xkb( int xkb_group, const char *xkb_layout, LANGID lang, DWORD klid )
+{
+    struct layout *layout;
+    WORD index = 0;
+
+    TRACE( "xkb_group %u, xkb_layout %s, lang %04x, klid %08x\n", xkb_group, xkb_layout, lang, klid );
+
+    LIST_FOR_EACH_ENTRY( layout, &xkb_layouts, struct layout, entry )
+    {
+        if (!strcmp( layout->xkb_layout, xkb_layout ))
+        {
+            TRACE( "Found existing layout entry %p, lang %04x, klid %08x, layout_id %04x\n",
+                   layout, layout->lang, layout->klid, layout->layout_id );
+            if (layout->xkb_group == -1) layout->xkb_group = xkb_group;
+            return;
+        }
+        if (lang == layout->lang && HIWORD(layout->klid) >= 0x20) index++;
+    }
+
+    if (!(layout = calloc( 1, sizeof(*layout) + strlen( xkb_layout ) + 1 )))
+    {
+        WARN( "Failed to allocate memory for Xkb layout entry\n" );
+        return;
+    }
+    list_add_tail( &xkb_layouts, &layout->entry );
+
+    layout->xkb_group = xkb_group;
+    layout->xkb_layout = strcpy( (char *)(layout + 1), xkb_layout );
+
+    layout->lang = lang;
+    layout->klid = !klid ? MAKELONG(lang, 0) : (klid == -1) ? MAKELONG(lang, index + 0x20) : klid;
+    layout->layout_id = get_layout_id_from_klid( klid );
+
+    TRACE( "Created layout entry %p, lang %04x, klid %08x, layout_id %04x\n", layout, layout->lang, layout->klid, layout->layout_id );
+}
 
 /* Keyboard translation tables */
 #define MAIN_LEN 49
@@ -224,6 +331,15 @@ static const char main_key_US_dvorak[MAIN_LEN][4] =
  "'\"",",<",".>","pP","yY","fF","gG","cC","rR","lL","/?","=+",
  "aA","oO","eE","uU","iI","dD","hH","tT","nN","sS","-_","\\|",
  ";:","qQ","jJ","kK","xX","bB","mM","wW","vV","zZ"
+};
+
+/*** United States keyboard layout (programmer dvorak version) */
+static const char main_key_US_programmer_dvorak[MAIN_LEN][4] =
+{
+    "$~","&%","[7","{5","}3","(1","=9","*0",")2","+4","]6","!8","#`",
+    ";:",",<",".>","pP","yY","fF","gG","cC","rR","lL","/?","@^",
+    "aA","oO","eE","uU","iI","dD","hH","tT","nN","sS","-_","\\|",
+    "'\"","qQ","jJ","kK","xX","bB","mM","wW","vV","zZ"
 };
 
 /*** United States keyboard layout (dvorak phantom key version) */
@@ -865,6 +981,7 @@ static const struct {
  {0x0409, "United States keyboard layout (phantom key version)", &main_key_US_phantom, &main_key_scan_qwerty, &main_key_vkey_qwerty},
  /* Dvorak users tend to run QWERTY keyboards and rely on Windows/X11/Wayland to translate to the correct keysyms */
  {0x0409, "United States keyboard layout (dvorak)", &main_key_US_dvorak, &main_key_scan_qwerty, &main_key_vkey_dvorak},
+ {0x0409, "United States keyboard layout (programmer dvorak)", &main_key_US_programmer_dvorak, &main_key_scan_qwerty, &main_key_vkey_dvorak},
  {0x0409, "United States keyboard layout (dvorak with phantom key)", &main_key_US_dvorak_phantom, &main_key_scan_qwerty, &main_key_vkey_dvorak},
  {0x0409, "United States International keyboard layout", &main_key_US_intl, &main_key_scan_qwerty, &main_key_vkey_qwerty},
  {0x0809, "British keyboard layout", &main_key_UK, &main_key_scan_qwerty, &main_key_vkey_qwerty},
@@ -929,6 +1046,20 @@ static const struct {
  {0, NULL, NULL, NULL, NULL} /* sentinel */
 };
 static unsigned kbd_layout=0; /* index into above table of layouts */
+#ifdef SONAME_LIBXKBREGISTRY
+static struct rxkb_context *rxkb_context;
+
+static void *xkbregistry_handle;
+#define MAKE_FUNCPTR(f) static typeof(f) * p_##f;
+MAKE_FUNCPTR(rxkb_context_new)
+MAKE_FUNCPTR(rxkb_context_parse_default_ruleset)
+MAKE_FUNCPTR(rxkb_layout_first)
+MAKE_FUNCPTR(rxkb_layout_get_description)
+MAKE_FUNCPTR(rxkb_layout_get_name)
+MAKE_FUNCPTR(rxkb_layout_get_variant)
+MAKE_FUNCPTR(rxkb_layout_next)
+#undef MAKE_FUNCPTR
+#endif
 
 /* maybe more of these scancodes should be extended? */
                 /* extended must be set for ALT_R, CTRL_R,
@@ -1335,12 +1466,17 @@ BOOL X11DRV_KeyEvent( HWND hwnd, XEvent *xev )
     int ascii_chars;
     XIC xic = X11DRV_get_ic( hwnd );
     DWORD event_time = EVENT_x11_time_to_win32_time(event->time);
+    struct x11drv_win_data *data;
     Status status = 0;
 
     TRACE_(key)("type %d, window %lx, state 0x%04x, keycode %u\n",
 		event->type, event->window, event->state, event->keycode);
 
-    if (event->type == KeyPress) update_user_time( event->time );
+    if (event->type == KeyPress && (data = get_win_data( hwnd )))
+    {
+        window_set_user_time( data, event->time, FALSE );
+        release_win_data( data );
+    }
 
     /* Clients should pass only KeyPress events to XmbLookupString */
     if (xic && event->type == KeyPress)
@@ -1373,15 +1509,6 @@ BOOL X11DRV_KeyEvent( HWND hwnd, XEvent *xev )
 
     pthread_mutex_lock( &kbd_mutex );
 
-    /* If XKB extensions are used, the state mask for AltGr will use the group
-       index instead of the modifier mask. The group index is set in bits
-       13-14 of the state field in the XKeyEvent structure. So if AltGr is
-       pressed, look if the group index is different than 0. From XKB
-       extension documentation, the group index for AltGr should be 2
-       (event->state = 0x2000). It's probably better to not assume a
-       predefined group index and find it dynamically
-
-       Ref: X Keyboard Extension: Library specification (section 14.1.1 and 17.1.1) */
     /* Save also all possible modifier states. */
     AltGrMask = event->state & (0x6000 | Mod1Mask | Mod2Mask | Mod3Mask | Mod4Mask | Mod5Mask);
 
@@ -1420,24 +1547,196 @@ BOOL X11DRV_KeyEvent( HWND hwnd, XEvent *xev )
     return TRUE;
 }
 
-/**********************************************************************
- *		X11DRV_KEYBOARD_DetectLayout
- *
- * Called from X11DRV_InitKeyboard
- *  This routine walks through the defined keyboard layouts and selects
- *  whichever matches most closely.
- * kbd_section must be held.
- */
-static void
-X11DRV_KEYBOARD_DetectLayout( Display *display )
+static const struct layout_id_map_entry
 {
-  unsigned current, match, mismatch, seq, i, syms;
+    const char *name;
+    LANGID langid;
+} layout_ids[] =
+{
+    { "af", MAKELANGID(LANG_DARI, SUBLANG_DEFAULT) },
+    { "al", MAKELANGID(LANG_ALBANIAN, SUBLANG_DEFAULT) },
+    { "am", MAKELANGID(LANG_ARMENIAN, SUBLANG_DEFAULT) },
+    { "ara", MAKELANGID(LANG_ARABIC, SUBLANG_DEFAULT) },
+    { "at", MAKELANGID(LANG_GERMAN, SUBLANG_GERMAN_AUSTRIAN) },
+    { "az", MAKELANGID(LANG_AZERBAIJANI, SUBLANG_DEFAULT) },
+    { "au", MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_AUS) },
+    { "ba", MAKELANGID(LANG_BOSNIAN, SUBLANG_BOSNIAN_BOSNIA_HERZEGOVINA_CYRILLIC) },
+    { "bd", MAKELANGID(LANG_BANGLA, SUBLANG_DEFAULT) },
+    { "be", MAKELANGID(LANG_FRENCH, SUBLANG_FRENCH_BELGIAN) },
+    { "bg", MAKELANGID(LANG_BULGARIAN, SUBLANG_DEFAULT) },
+    { "br", MAKELANGID(LANG_PORTUGUESE, 2) },
+    { "brai", MAKELANGID(LANG_NEUTRAL, SUBLANG_CUSTOM_DEFAULT) },
+    { "bt", MAKELANGID(LANG_TIBETAN, 3) },
+    { "bw", MAKELANGID(LANG_TSWANA, SUBLANG_TSWANA_BOTSWANA) },
+    { "by", MAKELANGID(LANG_BELARUSIAN, SUBLANG_DEFAULT) },
+    { "ca", MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_CAN) },
+    { "cd", MAKELANGID(LANG_FRENCH, SUBLANG_CUSTOM_UNSPECIFIED) },
+    { "ch", MAKELANGID(LANG_GERMAN, SUBLANG_GERMAN_SWISS) },
+    { "cm", MAKELANGID(LANG_FRENCH, 11) },
+    { "cn", MAKELANGID(LANG_CHINESE, SUBLANG_DEFAULT) },
+    { "cz", MAKELANGID(LANG_CZECH, SUBLANG_DEFAULT) },
+    { "de", MAKELANGID(LANG_GERMAN, SUBLANG_DEFAULT) },
+    { "dk", MAKELANGID(LANG_DANISH, SUBLANG_DEFAULT) },
+    { "dz", MAKELANGID(LANG_TAMAZIGHT, SUBLANG_TAMAZIGHT_ALGERIA_LATIN) },
+    { "ee", MAKELANGID(LANG_ESTONIAN, SUBLANG_DEFAULT) },
+    { "epo", MAKELANGID(LANG_NEUTRAL, SUBLANG_CUSTOM_DEFAULT) },
+    { "es", MAKELANGID(LANG_SPANISH, SUBLANG_DEFAULT) },
+    { "et", MAKELANGID(LANG_AMHARIC, SUBLANG_DEFAULT) },
+    { "fi", MAKELANGID(LANG_FINNISH, SUBLANG_DEFAULT) },
+    { "fo", MAKELANGID(LANG_FAEROESE, SUBLANG_DEFAULT) },
+    { "fr", MAKELANGID(LANG_FRENCH, SUBLANG_DEFAULT) },
+    { "gb", MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_UK) },
+    { "ge", MAKELANGID(LANG_GEORGIAN, SUBLANG_DEFAULT) },
+    { "gh", MAKELANGID(LANG_ENGLISH, SUBLANG_CUSTOM_UNSPECIFIED) },
+    { "gn", MAKELANGID(LANG_NEUTRAL, SUBLANG_CUSTOM_DEFAULT) },
+    { "gr", MAKELANGID(LANG_GREEK, SUBLANG_DEFAULT) },
+    { "hr", MAKELANGID(LANG_CROATIAN, SUBLANG_DEFAULT) },
+    { "hu", MAKELANGID(LANG_HUNGARIAN, SUBLANG_DEFAULT) },
+    { "id", MAKELANGID(LANG_INDONESIAN, SUBLANG_DEFAULT) },
+    { "ie", MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_EIRE) },
+    { "il", MAKELANGID(LANG_HEBREW, SUBLANG_DEFAULT) },
+    { "in", MAKELANGID(LANG_HINDI, SUBLANG_DEFAULT) },
+    { "iq", MAKELANGID(LANG_ARABIC, SUBLANG_ARABIC_IRAQ) },
+    { "ir", MAKELANGID(LANG_PERSIAN, SUBLANG_DEFAULT) },
+    { "is", MAKELANGID(LANG_ICELANDIC, SUBLANG_DEFAULT) },
+    { "it", MAKELANGID(LANG_ITALIAN, SUBLANG_DEFAULT) },
+    { "jp", MAKELANGID(LANG_JAPANESE, SUBLANG_DEFAULT) },
+    { "ke", MAKELANGID(LANG_NEUTRAL, SUBLANG_CUSTOM_DEFAULT) },
+    { "kg", MAKELANGID(LANG_KYRGYZ, SUBLANG_DEFAULT) },
+    { "kh", MAKELANGID(LANG_KHMER, SUBLANG_DEFAULT) },
+    { "kr", MAKELANGID(LANG_KOREAN, SUBLANG_DEFAULT) },
+    { "kz", MAKELANGID(LANG_KAZAK, SUBLANG_DEFAULT) },
+    { "la", MAKELANGID(LANG_LAO, SUBLANG_DEFAULT) },
+    { "latam", MAKELANGID(LANG_SPANISH, SUBLANG_CUSTOM_UNSPECIFIED) },
+    { "lk", MAKELANGID(LANG_SINHALESE, SUBLANG_DEFAULT) },
+    { "lt", MAKELANGID(LANG_LITHUANIAN, SUBLANG_DEFAULT) },
+    { "lv", MAKELANGID(LANG_LATVIAN, SUBLANG_DEFAULT) },
+    { "ma", MAKELANGID(LANG_ARABIC, SUBLANG_ARABIC_MOROCCO) },
+    { "mao", MAKELANGID(LANG_MAORI, SUBLANG_DEFAULT) },
+    { "md", MAKELANGID(LANG_ROMANIAN, SUBLANG_CUSTOM_UNSPECIFIED) },
+    { "me", MAKELANGID(LANG_SERBIAN, SUBLANG_SERBIAN_MONTENEGRO_LATIN) },
+    { "mk", MAKELANGID(LANG_MACEDONIAN, SUBLANG_DEFAULT) },
+    { "ml", MAKELANGID(LANG_NEUTRAL, SUBLANG_CUSTOM_DEFAULT) },
+    { "mm", MAKELANGID(0x55 /*LANG_BURMESE*/, SUBLANG_DEFAULT) },
+    { "mn", MAKELANGID(LANG_MONGOLIAN, SUBLANG_DEFAULT) },
+    { "mt", MAKELANGID(LANG_MALTESE, SUBLANG_DEFAULT) },
+    { "mv", MAKELANGID(LANG_DIVEHI, SUBLANG_DEFAULT) },
+    { "my", MAKELANGID(LANG_MALAY, SUBLANG_DEFAULT) },
+    { "ng", MAKELANGID(LANG_ENGLISH, SUBLANG_CUSTOM_UNSPECIFIED) },
+    { "nl", MAKELANGID(LANG_DUTCH, SUBLANG_DEFAULT) },
+    { "no", MAKELANGID(LANG_NORWEGIAN, SUBLANG_DEFAULT) },
+    { "np", MAKELANGID(LANG_NEPALI, SUBLANG_DEFAULT) },
+    { "ph", MAKELANGID(LANG_FILIPINO, SUBLANG_DEFAULT) },
+    { "pk", MAKELANGID(LANG_URDU, SUBLANG_DEFAULT) },
+    { "pl", MAKELANGID(LANG_POLISH, SUBLANG_DEFAULT) },
+    { "pt", MAKELANGID(LANG_PORTUGUESE, SUBLANG_DEFAULT) },
+    { "ro", MAKELANGID(LANG_ROMANIAN, SUBLANG_DEFAULT) },
+    { "rs", MAKELANGID(LANG_SERBIAN, SUBLANG_SERBIAN_LATIN) },
+    { "ru", MAKELANGID(LANG_RUSSIAN, SUBLANG_DEFAULT) },
+    { "se", MAKELANGID(LANG_SWEDISH, SUBLANG_DEFAULT) },
+    { "si", MAKELANGID(LANG_SLOVENIAN, SUBLANG_DEFAULT) },
+    { "sk", MAKELANGID(LANG_SLOVAK, SUBLANG_DEFAULT) },
+    { "sn", MAKELANGID(LANG_WOLOF, SUBLANG_DEFAULT) },
+    { "sy", MAKELANGID(LANG_SYRIAC, SUBLANG_DEFAULT) },
+    { "tg", MAKELANGID(LANG_FRENCH, SUBLANG_CUSTOM_UNSPECIFIED) },
+    { "th", MAKELANGID(LANG_THAI, SUBLANG_DEFAULT) },
+    { "tj", MAKELANGID(LANG_TAJIK, SUBLANG_DEFAULT) },
+    { "tm", MAKELANGID(LANG_TURKMEN, SUBLANG_DEFAULT) },
+    { "tr", MAKELANGID(LANG_TURKISH, SUBLANG_DEFAULT) },
+    { "tw", MAKELANGID(LANG_CHINESE, SUBLANG_CUSTOM_UNSPECIFIED) },
+    { "tz", MAKELANGID(LANG_SWAHILI, SUBLANG_CUSTOM_UNSPECIFIED) },
+    { "ua", MAKELANGID(LANG_UKRAINIAN, SUBLANG_DEFAULT) },
+    { "us", MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT) },
+    { "uz", MAKELANGID(LANG_UZBEK, 2) },
+    { "vn", MAKELANGID(LANG_VIETNAMESE, SUBLANG_DEFAULT) },
+    { "za", MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_SOUTH_AFRICA) },
+};
+
+static int layout_id_map_cmp( const void *key, const void *element )
+{
+    const struct layout_id_map_entry *entry = element;
+    return strcmp( key, entry->name );
+}
+
+static LANGID langid_from_xkb_layout( const char *layout )
+{
+    const struct layout_id_map_entry *entry;
+
+    entry = bsearch( layout, layout_ids, ARRAY_SIZE(layout_ids), sizeof(*layout_ids), layout_id_map_cmp );
+    if (entry) return entry->langid;
+
+    FIXME( "Unknown layout %s\n", debugstr_a(layout) );
+    return MAKELANGID(LANG_NEUTRAL, SUBLANG_CUSTOM_UNSPECIFIED);
+};
+
+static const char *xkb_layout_from_langid( LANGID langid )
+{
+    for (int i = 0; i < ARRAY_SIZE(layout_ids); i++)
+        if (langid == layout_ids[i].langid)
+            return layout_ids[i].name;
+    return NULL;
+}
+
+static const struct klid_map_entry
+{
+    const char *layout;
+    const char *variant;
+    DWORD klid;
+} klid_map[] =
+{
+    { "us", "dvorak", 0x00010409 },
+    { "us", "dvorak-l", 0x00030409 },
+    { "us", "dvorak-r", 0x00040409 },
+};
+
+static int klid_map_cmp( const void *key, const void *element )
+{
+    const struct klid_map_entry *map_key = key;
+    const struct klid_map_entry *entry = element;
+    int c;
+
+    if ((c = strcmp( map_key->layout, entry->layout ))) return c;
+    return strcmp( map_key->variant, entry->variant );
+}
+
+static DWORD klid_from_xkb_layout( const char *layout, const char *variant )
+{
+    struct klid_map_entry key = { layout, variant };
+    const struct klid_map_entry *entry;
+
+    if (!variant)
+        return 0;
+
+    entry = bsearch( &key, klid_map, ARRAY_SIZE(klid_map), sizeof(*klid_map), klid_map_cmp );
+    if (entry) return entry->klid;
+
+    FIXME( "Unknown variant %s\n", debugstr_a(variant) );
+    return -1;
+}
+
+/* fuzzy layout detection through keysym / keycode matching, kbd_section must be held */
+static unsigned int detect_keyboard_layout( Display *display, XModifierKeymap *modmap, unsigned int xkb_group )
+{
+  unsigned current, match, mismatch, seq, i, syms, best_layout = 0;
   int score, keyc, key, pkey, ok;
-  KeySym keysym = 0;
+  KeySym keysym;
   const char (*lkey)[MAIN_LEN][4];
   unsigned max_seq = 0;
   int max_score = INT_MIN, ismatch = 0;
   char ckey[256][4];
+  unsigned int state, altgr_mod = 0, dummy, mod;
+
+  TRACE( "display %p, mmp %p, xkb_group %u\n", display, modmap, xkb_group );
+
+  for (mod = 0; mod < 8 * modmap->max_keypermod; mod++)
+  {
+      int xmod = 1 << (mod / modmap->max_keypermod);
+
+      if (!(keyc = modmap->modifiermap[mod])) continue;
+      XkbLookupKeySym( display, keyc, xkb_group * 0x2000, &dummy, &keysym );
+      if (keysym == XK_ISO_Level3_Shift) altgr_mod = xmod;
+  }
+  TRACE( "AltGr is mapped to mod %#x\n", altgr_mod );
 
   syms = keysyms_per_keycode;
   if (syms > 4) {
@@ -1446,10 +1745,16 @@ X11DRV_KEYBOARD_DetectLayout( Display *display )
   }
 
   memset( ckey, 0, sizeof(ckey) );
-  for (keyc = min_keycode; keyc <= max_keycode; keyc++) {
+  for (keyc = min_keycode; keyc <= max_keycode; keyc++)
+  {
       /* get data for keycode from X server */
-      for (i = 0; i < syms; i++) {
-        if (!(keysym = XkbKeycodeToKeysym( display, keyc, 0, i ))) continue;
+      for (i = 0; i < syms; i++)
+      {
+          /* With Xkb, the current group index is encoded in bits 13-14 of the state field.
+           * Ref: X Keyboard Extension: Library specification (section 18.1.1)
+           */
+          state = xkb_group << 13 | (i & 1 ? ShiftMask : 0) | (i & 2 ? altgr_mod : 0);
+          if (!XkbLookupKeySym( display, keyc, state, &dummy, &keysym )) continue;
 	/* Allow both one-byte and two-byte national keysyms */
 	if ((keysym < 0x8000) && (keysym != ' '))
         {
@@ -1517,7 +1822,7 @@ X11DRV_KEYBOARD_DetectLayout( Display *display )
 	   match, mismatch, seq, score);
     if (score + (int)seq > max_score + (int)max_seq) {
       /* best match so far */
-      kbd_layout = current;
+      best_layout = current;
       max_score = score;
       max_seq = seq;
       ismatch = !mismatch;
@@ -1526,20 +1831,17 @@ X11DRV_KEYBOARD_DetectLayout( Display *display )
   /* we're done, report results if necessary */
   if (!ismatch)
     WARN("Using closest match (%s) for scan/virtual codes mapping.\n",
-        main_key_tab[kbd_layout].comment);
+        main_key_tab[best_layout].comment);
 
-  TRACE("detected layout is \"%s\"\n", main_key_tab[kbd_layout].comment);
+  TRACE("detected layout is \"%s\"\n", main_key_tab[best_layout].comment);
+  return best_layout;
 }
 
 
-/**********************************************************************
- *		X11DRV_InitKeyboard
- */
-void X11DRV_InitKeyboard( Display *display )
+/* initialize keyc2scan and keyc2vkey */
+static void init_keycode_mappings( Display *display )
 {
-    XModifierKeymap *mmp;
     KeySym keysym;
-    KeyCode *kcp;
     XKeyEvent e2;
     WORD scan, vkey;
     int keyc, i, keyn, syms;
@@ -1566,38 +1868,6 @@ void X11DRV_InitKeyboard( Display *display )
     };
     int vkey_range;
 
-    pthread_mutex_lock( &kbd_mutex );
-    XDisplayKeycodes(display, &min_keycode, &max_keycode);
-    XFree( XGetKeyboardMapping( display, min_keycode, max_keycode + 1 - min_keycode, &keysyms_per_keycode ) );
-
-    mmp = XGetModifierMapping(display);
-    kcp = mmp->modifiermap;
-    for (i = 0; i < 8; i += 1) /* There are 8 modifier keys */
-    {
-        int j;
-
-        for (j = 0; j < mmp->max_keypermod; j += 1, kcp += 1)
-	    if (*kcp)
-            {
-		int k;
-
-		for (k = 0; k < keysyms_per_keycode; k += 1)
-                    if (XkbKeycodeToKeysym( display, *kcp, 0, k ) == XK_Num_Lock)
-		    {
-                        NumLockMask = 1 << i;
-                        TRACE_(key)("NumLockMask is %x\n", NumLockMask);
-		    }
-                    else if (XkbKeycodeToKeysym( display, *kcp, 0, k ) == XK_Scroll_Lock)
-		    {
-                        ScrollLockMask = 1 << i;
-                        TRACE_(key)("ScrollLockMask is %x\n", ScrollLockMask);
-		    }
-            }
-    }
-    XFreeModifiermap(mmp);
-
-    /* Detect the keyboard layout */
-    X11DRV_KEYBOARD_DetectLayout( display );
     lkey = main_key_tab[kbd_layout].key;
     syms = (keysyms_per_keycode > 4) ? 4 : keysyms_per_keycode;
 
@@ -1798,6 +2068,131 @@ void X11DRV_InitKeyboard( Display *display )
 	TRACE_(key)("assigning scancode %02x to unidentified keycode %u (%s)\n",scan,keyc,ksname);
 	keyc2scan[keyc]=scan++;
       }
+}
+
+static void find_xkb_layout_variant( Display *display, XModifierKeymap *mmp, int group, const char *name,
+                                     const char **layout, const char **variant )
+{
+    unsigned int index;
+#ifdef SONAME_LIBXKBREGISTRY
+    struct rxkb_layout *iter;
+
+    if (!rxkb_context) WARN( "libxkbregistry not available, falling back to fuzzy layout detection\n" );
+    else if (!name) WARN( "Xkb layout name not found, falling back to fuzzy layout detection\n" );
+    else
+    {
+        for (iter = p_rxkb_layout_first( rxkb_context ); iter; iter = p_rxkb_layout_next( iter ))
+        {
+            const char *desc = p_rxkb_layout_get_description( iter );
+
+            if (desc && !strcmp( name, desc ))
+            {
+                *layout = p_rxkb_layout_get_name( iter );
+                *variant = p_rxkb_layout_get_variant( iter );
+                return;
+            }
+        }
+
+        WARN( "Unknown Xkb layout name %s\n", debugstr_a(name) );
+    }
+#else
+    WARN( "libxkbregistry support not compiled in, falling back to fuzzy layout detection\n" );
+#endif
+
+    index = detect_keyboard_layout( display, mmp, group );
+    *layout = xkb_layout_from_langid( main_key_tab[index].lcid );
+    if (strstr( main_key_tab[index].comment, "dvorak" )) *variant = "dvorak";
+}
+
+/* initialize or update keyboard layouts */
+void init_keyboard_layouts( Display *display )
+{
+    char *names[4] = { NULL };
+    unsigned int xkb_group;
+    XkbStateRec xkb_state;
+    XModifierKeymap *mmp;
+    XkbDescRec *xkb_desc;
+    struct layout *entry;
+    LANGID xkb_lang = 0;
+    Status status;
+    KeyCode *kcp;
+    int count;
+
+    pthread_mutex_lock( &kbd_mutex );
+    XDisplayKeycodes( display, &min_keycode, &max_keycode );
+    XFree( XGetKeyboardMapping( display, min_keycode, max_keycode + 1 - min_keycode, &keysyms_per_keycode ) );
+
+    mmp = XGetModifierMapping( display );
+    kcp = mmp->modifiermap;
+    for (int i = 0; i < 8; i += 1) /* There are 8 modifier keys */
+    {
+        for (int j = 0; j < mmp->max_keypermod; j += 1, kcp += 1)
+        {
+            for (int k = 0; *kcp && k < keysyms_per_keycode; k += 1)
+            {
+                if (XkbKeycodeToKeysym( display, *kcp, 0, k ) == XK_Num_Lock)
+                {
+                    NumLockMask = 1 << i;
+                    TRACE_(key)( "NumLockMask is %x\n", NumLockMask );
+                }
+                else if (XkbKeycodeToKeysym( display, *kcp, 0, k ) == XK_Scroll_Lock)
+                {
+                    ScrollLockMask = 1 << i;
+                    TRACE_(key)( "ScrollLockMask is %x\n", ScrollLockMask );
+                }
+            }
+        }
+    }
+
+    /* Flag any previously created Xkb layout as invalid */
+    LIST_FOR_EACH_ENTRY( entry, &xkb_layouts, struct layout, entry )
+        entry->xkb_group = -1;
+
+    status = XkbGetState( display, XkbUseCoreKbd, &xkb_state );
+    xkb_group = status ? 0 : xkb_state.group;
+    TRACE( "current group %u (status %#x)\n", xkb_group, status );
+
+    if ((xkb_desc = XkbGetMap( display, XkbAllClientInfoMask, XkbUseCoreKbd )))
+    {
+        XkbGetNames( display, XkbGroupNamesMask, xkb_desc );
+        for (count = 0; count < ARRAY_SIZE(xkb_desc->names->groups); count++)
+            if (!xkb_desc->names->groups[count]) break;
+
+        if (!XGetAtomNames( display, xkb_desc->names->groups, count, names )) count = 0;
+        TRACE( "Found %u group names\n", count );
+        XkbFreeKeyboard( xkb_desc, 0, True );
+    }
+    else count = status ? 1 : 4;
+
+    for (int i = 0; i < count; i++)
+    {
+        const char *layout, *variant = NULL;
+        char buffer[1024];
+        DWORD klid;
+        LANGID lang;
+
+        find_xkb_layout_variant( display, mmp, i, names[i], &layout, &variant );
+        lang = langid_from_xkb_layout( layout );
+        klid = klid_from_xkb_layout( layout, variant );
+        if (i == xkb_group) xkb_lang = lang;
+
+        TRACE( "Found group %u with name %s -> layout %s:%s, lang %04x, klid %08x\n", i, debugstr_a(names[i]),
+               debugstr_a(layout), debugstr_a(variant), lang, klid );
+
+        snprintf( buffer, ARRAY_SIZE(buffer), "%s:%s", layout, variant );
+        create_layout_from_xkb( i, buffer, lang, klid );
+
+        if (names[i]) XFree( names[i] );
+    }
+
+    kbd_layout = detect_keyboard_layout( display, mmp, xkb_group );
+    XFreeModifiermap( mmp );
+
+    if (xkb_lang && xkb_lang != main_key_tab[kbd_layout].lcid)
+        WARN( "Xkb langid %04x differs from detected langid %04x\n",
+              xkb_lang, main_key_tab[kbd_layout].lcid );
+
+    init_keycode_mappings( display );
 
     pthread_mutex_unlock( &kbd_mutex );
 }
@@ -1808,7 +2203,7 @@ void X11DRV_InitKeyboard( Display *display )
  */
 BOOL X11DRV_ActivateKeyboardLayout(HKL hkl, UINT flags)
 {
-    FIXME("%p, %04x: semi-stub!\n", hkl, flags);
+    WARN("%p, %04x: semi-stub!\n", hkl, flags);
 
     if (flags & KLF_SETFORPROCESS)
     {
@@ -1829,13 +2224,54 @@ BOOL X11DRV_MappingNotify( HWND dummy, XEvent *event )
     HWND hwnd;
 
     XRefreshKeyboardMapping(&event->xmapping);
-    X11DRV_InitKeyboard( event->xmapping.display );
+    init_keyboard_layouts( event->xmapping.display );
 
     hwnd = get_focus();
     if (!hwnd) hwnd = get_active_window();
     NtUserPostMessage( hwnd, WM_INPUTLANGCHANGEREQUEST,
                        0 /*FIXME*/, (LPARAM)NtUserGetKeyboardLayout(0) );
     return TRUE;
+}
+
+
+/***********************************************************************
+ *           x11drv_init_keyboard
+ */
+void x11drv_init_keyboard( Display *display )
+{
+    XkbUseExtension( display, NULL, NULL );
+
+#ifdef SONAME_LIBXKBREGISTRY
+    if (!(xkbregistry_handle = dlopen( SONAME_LIBXKBREGISTRY, RTLD_NOW )))
+    {
+        WARN( "Failed to load %s\n", SONAME_LIBXKBREGISTRY );
+        goto xkbregistry_init_done;
+    }
+#define LOAD_FUNCPTR( f )                                                                          \
+    if (!(p_##f = dlsym( xkbregistry_handle, #f )))                                                \
+    {                                                                                              \
+        ERR( "Failed to find " #f "\n" );                                                          \
+        dlclose( xkbregistry_handle );                                                             \
+        goto xkbregistry_init_done;                                                                \
+    }
+
+    LOAD_FUNCPTR(rxkb_context_new)
+    LOAD_FUNCPTR(rxkb_context_parse_default_ruleset)
+    LOAD_FUNCPTR(rxkb_layout_first)
+    LOAD_FUNCPTR(rxkb_layout_get_description)
+    LOAD_FUNCPTR(rxkb_layout_get_name)
+    LOAD_FUNCPTR(rxkb_layout_get_variant)
+    LOAD_FUNCPTR(rxkb_layout_next)
+#undef LOAD_FUNCPTR
+
+    if (!(rxkb_context = p_rxkb_context_new( RXKB_CONTEXT_NO_FLAGS )) ||
+        !p_rxkb_context_parse_default_ruleset( rxkb_context ))
+        ERR( "Failed to parse default Xkb ruleset\n" );
+
+xkbregistry_init_done:
+#endif
+
+    init_keyboard_layouts( display );
 }
 
 

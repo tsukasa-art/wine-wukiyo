@@ -26,9 +26,9 @@
 #include <assert.h>
 #include <pthread.h>
 #include "ntstatus.h"
-#define WIN32_NO_STATUS
 #include "ntgdi_private.h"
 #include "ntuser_private.h"
+#include "wine/opengl_driver.h"
 #include "wine/server.h"
 #include "wine/debug.h"
 
@@ -416,20 +416,23 @@ static BOOL set_surface_shape( struct window_surface *surface, const RECT *rect,
     char shape_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
     BITMAPINFO *shape_info = (BITMAPINFO *)shape_buf;
     COLORREF color_key = surface->color_key;
-    void *shape_bits, *old_shape;
+    void *shape_bits, *old_shape = NULL;
     RECT *shape_rect, tmp_rect;
     WINEREGION *data;
-    BOOL ret;
+    BOOL ret, is_new;
 
     width = color_info->bmiHeader.biWidth;
     height = abs( color_info->bmiHeader.biHeight );
     assert( !(width & 7) ); /* expect 1bpp bitmap to be aligned on bytes */
 
-    if (!surface->shape_bitmap) surface->shape_bitmap = NtGdiCreateBitmap( width, height, 1, 1, NULL );
+    if ((is_new = !surface->shape_bitmap)) surface->shape_bitmap = NtGdiCreateBitmap( width, height, 1, 1, NULL );
     if (!(shape_bits = window_surface_get_shape( surface, shape_info ))) return FALSE;
 
-    old_shape = malloc( shape_info->bmiHeader.biSizeImage );
-    memcpy( old_shape, shape_bits, shape_info->bmiHeader.biSizeImage );
+    if (!is_new)
+    {
+        old_shape = malloc( shape_info->bmiHeader.biSizeImage );
+        memcpy( old_shape, shape_bits, shape_info->bmiHeader.biSizeImage );
+    }
 
     color_stride = color_info->bmiHeader.biSizeImage / height;
     shape_stride = shape_info->bmiHeader.biSizeImage / abs( shape_info->bmiHeader.biHeight );
@@ -499,7 +502,7 @@ static BOOL set_surface_shape( struct window_surface *surface, const RECT *rect,
     }
     }
 
-    ret = memcmp( old_shape, shape_bits, shape_info->bmiHeader.biSizeImage );
+    ret = is_new || memcmp( old_shape, shape_bits, shape_info->bmiHeader.biSizeImage );
     free( old_shape );
     return ret;
 }
@@ -523,66 +526,7 @@ static BOOL update_surface_shape( struct window_surface *surface, const RECT *re
         return clear_surface_shape( surface );
 }
 
-W32KAPI struct window_surface *window_surface_create( UINT size, const struct window_surface_funcs *funcs, HWND hwnd,
-                                                      const RECT *rect, BITMAPINFO *info, HBITMAP bitmap )
-{
-    struct window_surface *surface;
-
-    if (!(surface = calloc( 1, size ))) return NULL;
-    surface->funcs = funcs;
-    surface->ref = 1;
-    surface->hwnd = hwnd;
-    surface->rect = *rect;
-    surface->color_key = CLR_INVALID;
-    surface->alpha_bits = -1;
-    surface->alpha_mask = 0;
-    reset_bounds( &surface->bounds );
-
-    if (!bitmap) bitmap = NtGdiCreateDIBSection( 0, NULL, 0, info, DIB_RGB_COLORS, 0, 0, 0, NULL );
-    if (!(surface->color_bitmap = bitmap))
-    {
-        free( surface );
-        return NULL;
-    }
-
-    pthread_mutex_init( &surface->mutex, NULL );
-
-    TRACE( "created surface %p for hwnd %p rect %s\n", surface, hwnd, wine_dbgstr_rect( &surface->rect ) );
-    return surface;
-}
-
-W32KAPI void window_surface_add_ref( struct window_surface *surface )
-{
-    InterlockedIncrement( &surface->ref );
-}
-
-W32KAPI void window_surface_release( struct window_surface *surface )
-{
-    ULONG ret = InterlockedDecrement( &surface->ref );
-    if (!ret)
-    {
-        if (surface != &dummy_surface) pthread_mutex_destroy( &surface->mutex );
-        if (surface->clip_region) NtGdiDeleteObjectApp( surface->clip_region );
-        if (surface->color_bitmap) NtGdiDeleteObjectApp( surface->color_bitmap );
-        if (surface->shape_bitmap) NtGdiDeleteObjectApp( surface->shape_bitmap );
-        surface->funcs->destroy( surface );
-        if (surface != &dummy_surface) free( surface );
-    }
-}
-
-W32KAPI void window_surface_lock( struct window_surface *surface )
-{
-    if (surface == &dummy_surface) return;
-    pthread_mutex_lock( &surface->mutex );
-}
-
-W32KAPI void window_surface_unlock( struct window_surface *surface )
-{
-    if (surface == &dummy_surface) return;
-    pthread_mutex_unlock( &surface->mutex );
-}
-
-void *window_surface_get_color( struct window_surface *surface, BITMAPINFO *info )
+static void *window_surface_get_color( struct window_surface *surface, BITMAPINFO *info )
 {
     struct bitblt_coords coords = {0};
     struct gdi_image_bits gdi_bits;
@@ -605,7 +549,68 @@ void *window_surface_get_color( struct window_surface *surface, BITMAPINFO *info
     return gdi_bits.ptr;
 }
 
-W32KAPI void window_surface_flush( struct window_surface *surface )
+struct window_surface *window_surface_create( UINT size, const struct window_surface_funcs *funcs, HWND hwnd,
+                                              const RECT *rect, BITMAPINFO *info, HBITMAP bitmap )
+{
+    struct window_surface *surface;
+
+    if (!(surface = calloc( 1, size ))) return NULL;
+    surface->funcs = funcs;
+    surface->ref = 1;
+    surface->hwnd = hwnd;
+    surface->rect = *rect;
+    surface->color_key = CLR_INVALID;
+    surface->alpha_bits = -1;
+    surface->alpha_mask = 0;
+    reset_bounds( &surface->bounds );
+
+    if (!bitmap) bitmap = NtGdiCreateDIBSection( 0, NULL, 0, info, DIB_RGB_COLORS, 0, 0, 0, NULL );
+    if (!(surface->color_bitmap = bitmap))
+    {
+        free( surface );
+        return NULL;
+    }
+
+    pthread_mutex_init( &surface->mutex, NULL );
+
+    memset( window_surface_get_color( surface, info ), 0xff, info->bmiHeader.biSizeImage );
+
+    TRACE( "created surface %p for hwnd %p rect %s\n", surface, hwnd, wine_dbgstr_rect( &surface->rect ) );
+    return surface;
+}
+
+void window_surface_add_ref( struct window_surface *surface )
+{
+    InterlockedIncrement( &surface->ref );
+}
+
+void window_surface_release( struct window_surface *surface )
+{
+    ULONG ret = InterlockedDecrement( &surface->ref );
+    if (!ret)
+    {
+        if (surface != &dummy_surface) pthread_mutex_destroy( &surface->mutex );
+        if (surface->clip_region) NtGdiDeleteObjectApp( surface->clip_region );
+        if (surface->color_bitmap) NtGdiDeleteObjectApp( surface->color_bitmap );
+        if (surface->shape_bitmap) NtGdiDeleteObjectApp( surface->shape_bitmap );
+        surface->funcs->destroy( surface );
+        if (surface != &dummy_surface) free( surface );
+    }
+}
+
+void window_surface_lock( struct window_surface *surface )
+{
+    if (surface == &dummy_surface) return;
+    pthread_mutex_lock( &surface->mutex );
+}
+
+void window_surface_unlock( struct window_surface *surface )
+{
+    if (surface == &dummy_surface) return;
+    pthread_mutex_unlock( &surface->mutex );
+}
+
+void window_surface_flush( struct window_surface *surface )
 {
     char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
     char shape_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
@@ -640,7 +645,7 @@ W32KAPI void window_surface_flush( struct window_surface *surface )
     window_surface_unlock( surface );
 }
 
-W32KAPI void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask )
+void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask )
 {
     char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
     BITMAPINFO *color_info = (BITMAPINFO *)color_buf;
@@ -669,7 +674,7 @@ W32KAPI void window_surface_set_layered( struct window_surface *surface, COLORRE
     window_surface_unlock( surface );
 }
 
-W32KAPI void window_surface_set_clip( struct window_surface *surface, HRGN clip_region )
+void window_surface_set_clip( struct window_surface *surface, HRGN clip_region )
 {
     window_surface_lock( surface );
 
@@ -702,7 +707,7 @@ W32KAPI void window_surface_set_clip( struct window_surface *surface, HRGN clip_
     window_surface_unlock( surface );
 }
 
-W32KAPI void window_surface_set_shape( struct window_surface *surface, HRGN shape_region )
+void window_surface_set_shape( struct window_surface *surface, HRGN shape_region )
 {
     window_surface_lock( surface );
 
@@ -860,7 +865,7 @@ static void update_visible_region( struct dce *dce )
                                         (flags & DCX_INTERSECTRGN) ? RGN_AND : RGN_DIFF );
 
     /* don't use a surface to paint the client area of OpenGL windows */
-    if (!(paint_flags & SET_WINPOS_PIXEL_FORMAT) || (flags & DCX_WINDOW))
+    if (!(paint_flags & SET_WINPOS_PIXEL_FORMAT && user_driver->dc_funcs.pPutImage) || (flags & DCX_WINDOW))
     {
         win = get_win_ptr( top_win );
         if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
@@ -1067,7 +1072,7 @@ static struct dce *get_window_dce( HWND hwnd )
  *
  * Free a class or window DCE.
  */
-void free_dce( struct dce *dce, HWND hwnd )
+void free_dce( struct dce *dce, HWND hwnd, struct list *drawables )
 {
     struct dce *dce_to_free = NULL;
 
@@ -1101,6 +1106,7 @@ void free_dce( struct dce *dce, HWND hwnd )
             {
                 WARN( "GetDC() without ReleaseDC() for window %p\n", hwnd );
                 dce->count = 0;
+                set_dc_pixel_format_internal( dce->hdc, 0, drawables );
                 set_dce_flags( dce->hdc, DCHF_DISABLEDC );
             }
         }
@@ -1114,6 +1120,18 @@ void free_dce( struct dce *dce, HWND hwnd )
         NtGdiDeleteObjectApp( dce_to_free->hdc );
         free( dce_to_free );
     }
+}
+
+BOOL is_cache_dc( HDC hdc )
+{
+    BOOL ret = FALSE;
+    struct dce *dce;
+
+    user_lock();
+    if ((dce = get_dc_dce( hdc ))) ret = !!(dce->flags & DCX_CACHE);
+    user_unlock();
+
+    return ret;
 }
 
 /***********************************************************************
@@ -1153,9 +1171,9 @@ void invalidate_dce( WND *win, const RECT *old_rect )
 
     if (!win->parent) return;
 
-    context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( win->obj.handle ));
+    context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( win->handle ) );
 
-    TRACE("%p parent %p, old_rect %s\n", win->obj.handle, win->parent, wine_dbgstr_rect(old_rect) );
+    TRACE( "%p parent %p, old_rect %s\n", win->handle, win->parent, wine_dbgstr_rect( old_rect ) );
 
     /* walk all DCEs and fixup non-empty entries */
 
@@ -1170,7 +1188,7 @@ void invalidate_dce( WND *win, const RECT *old_rect )
             continue;  /* child window positions don't bother us */
 
         /* if DCE window is a child of hwnd, it has to be invalidated */
-        if (dce->hwnd == win->obj.handle || is_child( win->obj.handle, dce->hwnd ))
+        if (dce->hwnd == win->handle || is_child( win->handle, dce->hwnd ))
         {
             make_dc_dirty( dce );
             continue;
@@ -1183,7 +1201,7 @@ void invalidate_dce( WND *win, const RECT *old_rect )
             struct window_rects rects;
 
             /* get the parent client-relative old/new window rects */
-            get_window_rects( win->obj.handle, COORDS_PARENT, &rects, get_thread_dpi() );
+            get_window_rects( win->handle, COORDS_PARENT, &rects, get_thread_dpi() );
             old_window_rect = old_rect ? *old_rect : rects.window;
             new_window_rect = rects.window;
 
@@ -1209,6 +1227,7 @@ void invalidate_dce( WND *win, const RECT *old_rect )
  */
 static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
 {
+    struct list drawables = LIST_INIT( drawables );
     struct dce *dce;
     BOOL ret = FALSE;
 
@@ -1223,11 +1242,14 @@ static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
         if (dce->flags & DCX_CACHE)
         {
             dce->count = 0;
+            set_dc_pixel_format_internal( hdc, 0, &drawables );
             set_dce_flags( dce->hdc, DCHF_DISABLEDC );
         }
         ret = TRUE;
     }
     user_unlock();
+
+    release_opengl_drawables( &drawables );
     return ret;
 }
 
@@ -1241,12 +1263,12 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
     BOOL update_vis_rgn = TRUE;
     struct dce *dce;
     HWND parent;
-    LONG window_style = get_window_long( hwnd, GWL_STYLE );
+    DWORD window_style = get_window_long( hwnd, GWL_STYLE );
 
     if (!hwnd) hwnd = get_desktop_window();
     else hwnd = get_full_window_handle( hwnd );
 
-    TRACE( "hwnd %p, clip_rgn %p, flags %08x\n", hwnd, clip_rgn, (int)flags );
+    TRACE( "hwnd %p, clip_rgn %p, flags %08x\n", hwnd, clip_rgn, flags );
 
     if (!is_window(hwnd)) return 0;
 
@@ -1280,7 +1302,7 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
 
     if( flags & DCX_PARENTCLIP )
     {
-        LONG parent_style = get_window_long( parent, GWL_STYLE );
+        DWORD parent_style = get_window_long( parent, GWL_STYLE );
         if( (window_style & WS_VISIBLE) && (parent_style & WS_VISIBLE) )
         {
             flags &= ~DCX_CLIPCHILDREN;
@@ -1372,7 +1394,7 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
 
     if (update_vis_rgn) update_visible_region( dce );
 
-    TRACE( "(%p,%p,0x%x): returning %p%s\n", hwnd, clip_rgn, (int)flags, dce->hdc,
+    TRACE( "(%p,%p,0x%x): returning %p%s\n", hwnd, clip_rgn, flags, dce->hdc,
            update_vis_rgn ? " (updated)" : "" );
     return dce->hdc;
 }
@@ -1802,7 +1824,7 @@ BOOL WINAPI NtUserRedrawWindow( HWND hwnd, const RECT *rect, HRGN hrgn, UINT fla
     }
 
     /* process pending expose events before painting */
-    if (flags & RDW_UPDATENOW) user_driver->pProcessEvents( QS_PAINT );
+    if (flags & RDW_UPDATENOW) check_for_events( QS_PAINT );
 
     if (rect && !hrgn)
     {
@@ -1853,6 +1875,20 @@ BOOL WINAPI NtUserValidateRect( HWND hwnd, const RECT *rect )
     }
 
     return NtUserRedrawWindow( hwnd, rect, 0, flags );
+}
+
+/***********************************************************************
+ *           NtUserValidateRgn (win32u.@)
+ */
+BOOL WINAPI NtUserValidateRgn( HWND hwnd, HRGN hrgn )
+{
+    if (!hwnd)
+    {
+        RtlSetLastWin32Error( ERROR_INVALID_WINDOW_HANDLE );
+        return FALSE;
+    }
+
+    return NtUserRedrawWindow( hwnd, NULL, hrgn, RDW_VALIDATE );
 }
 
 /***********************************************************************
@@ -2066,10 +2102,13 @@ INT WINAPI NtUserScrollWindowEx( HWND hwnd, INT dx, INT dy, const RECT *rect,
     rdw_flags = (flags & SW_ERASE) && (flags & SW_INVALIDATE) ?
         RDW_INVALIDATE | RDW_ERASE  : RDW_INVALIDATE;
 
-    if (!is_window_drawable( hwnd, TRUE )) return ERROR;
     hwnd = get_full_window_handle( hwnd );
 
-    get_client_rect( hwnd, &rc, get_thread_dpi() );
+    if (!is_window_drawable( hwnd, TRUE ))
+        SetRectEmpty( &rc );
+    else
+        get_client_rect( hwnd, &rc, get_thread_dpi() );
+
     if (clip_rect) intersect_rect( &cliprc, &rc, clip_rect );
     else cliprc = rc;
 
@@ -2183,7 +2222,7 @@ INT WINAPI NtUserScrollWindowEx( HWND hwnd, INT dx, INT dy, const RECT *rect,
         NtGdiDeleteObjectApp( winupd_rgn );
     }
 
-    if (move_caret) set_caret_pos( new_caret_pos.x, new_caret_pos.y );
+    if (move_caret) NtUserSetCaretPos( new_caret_pos.x, new_caret_pos.y );
     if (caret_hwnd) NtUserShowCaret( caret_hwnd );
     if (own_rgn && update_rgn) NtGdiDeleteObjectApp( update_rgn );
 

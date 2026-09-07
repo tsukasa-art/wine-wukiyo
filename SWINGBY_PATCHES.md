@@ -1,11 +1,14 @@
 # Melammu Wine Patch Policy + Ledger (swingby-wine)
 
-Last updated: 2026-07-22
+Last updated: 2026-09-07
 
 This repository is the public Wine fork used by the private Melammu launcher.
-Its base is the **vanilla WineHQ Wine 10.0 release** (`b0738596`, "Release
-10.0.", Alexandre Julliard). Moving commit and file counts are deliberately not
-used as project claims.
+The existing stable lineage starts at **WineHQ Wine 10.0** (`b0738596`,
+"Release 10.0.", Alexandre Julliard). The `arm64-wine-11.12` branch integrates
+WineHQ `0c1585cf5bb9a29a5c480ee04d5529b8fc236044`, 15 commits after the official
+11.12 release, while retaining that Swingby lineage. It is an experimental
+migration candidate, not a replacement for the accepted runtime on `master`.
+Moving commit and file counts are not used as product capability claims.
 
 [Sikarugir](https://github.com/Sikarugir-App/Sikarugir) is credited as macOS
 Wine prior art, but its Wine tree is not carried wholesale. Patch `e9a93b3` is
@@ -193,3 +196,29 @@ Melammu launcher.
 - [melammu-vn source-only reference](https://github.com/tsukasa-art/melammu-vn)
 - [Zenn series, part 1](https://zenn.dev/tsukasa_art/articles/mac-eroge-compat-part1) — entry point to the series, not evidence of the current runtime state
 - [Zenn: Wukiyo to Melammu](https://zenn.dev/tsukasa_art/articles/melammu-wukiyo-bridge) — naming transition and series map, not evidence of the current runtime state
+
+## ARM64 migration integration
+
+The migration branch carries the tested XTAJIT32/64 and Unicorn connection,
+ARM64EC memory and exception handling, and limited 32-bit Unix-call bridges.
+The earlier Wine10 msync integration is replaced as a unit with the modern
+in-process synchronization integration used by this candidate. Original source
+copyright and license notices remain in the imported files.
+
+Existing compatibility changes are carried forward by behavior:
+
+- The self-referencing subclass guard uses server-owned window-procedure state.
+- RGB24 VMR-7 conversion is retained alongside upstream BI_BITFIELDS support.
+- Media output dimensions and uncompressed-sample attributes move to the
+  `colorcnv` and `msvproc` modules; deleted WineGStreamer implementations are
+  not restored.
+- Float mix saturation remains on the shared float mixer path.
+- The existing macOS capture exports and GL overlay helpers are retained with
+  the refactored OpenGL driver and client-view representation.
+- The x86 Rosetta thunk remains for that separate architecture; ARM64 CPU
+  translation uses XTAJIT instead.
+
+The old `build.sh` remains the x86 build route. ARM64 validation uses a separate
+build directory, a matching multi-architecture llvm-mingw toolchain, and the
+selected Unicorn library. Limited CPU and drawing checks do not establish
+full media, mixed GL/Metal, title-specific capture, or product-runtime parity.

@@ -35,6 +35,8 @@
 
 #define NTDLL_TLS_ERRNO 16  /* TLS slot for _errno() */
 
+#define NTDLL_ACTCTX_STACK_FRAME_HEAP_ALLOCATED 0x8 /* RTL_ACTIVATION_CONTEXT_STACK_FRAME.Flags */
+
 #ifdef __i386__
 static const USHORT current_machine = IMAGE_FILE_MACHINE_I386;
 #elif defined(__x86_64__)
@@ -47,11 +49,7 @@ static const USHORT current_machine = IMAGE_FILE_MACHINE_ARM64;
 static const USHORT current_machine = IMAGE_FILE_MACHINE_UNKNOWN;
 #endif
 
-#if defined(__i386__) || defined(__x86_64__) || defined(__arm__) || defined(__aarch64__)
 static const UINT_PTR page_size = 0x1000;
-#else
-extern UINT_PTR page_size;
-#endif
 
 /* exceptions */
 extern NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *context );
@@ -59,17 +57,68 @@ extern NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *conte
 extern NTSTATUS WINAPI dispatch_user_callback( void *args, ULONG len, ULONG id );
 extern EXCEPTION_DISPOSITION WINAPI user_callback_handler( EXCEPTION_RECORD *record, void *frame,
                                                            CONTEXT *context, void *dispatch );
-extern EXCEPTION_DISPOSITION WINAPI nested_exception_handler( EXCEPTION_RECORD *rec, void *frame,
-                                                              CONTEXT *context, void *dispatch );
 extern void DECLSPEC_NORETURN raise_status( NTSTATUS status, EXCEPTION_RECORD *rec );
 extern LONG WINAPI call_unhandled_exception_filter( PEXCEPTION_POINTERS eptr );
 extern void WINAPI process_breakpoint(void);
 
 static inline BOOL is_valid_frame( ULONG_PTR frame )
 {
-    if (frame & (sizeof(void*) - 1)) return FALSE;
-    return ((void *)frame >= NtCurrentTeb()->Tib.StackLimit &&
-            (void *)frame <= NtCurrentTeb()->Tib.StackBase);
+    TEB *teb = NtCurrentTeb();
+
+    if ((void *)frame >= teb->Tib.StackLimit && (void *)frame <= teb->Tib.StackBase)
+        return !(frame & (sizeof(void*) - 1));
+#ifdef _WIN64
+    if (teb->WowTebOffset)
+    {
+        TEB32 *wow_teb = (TEB32 *)((char *)teb + teb->WowTebOffset);
+
+        if (frame >= wow_teb->Tib.StackLimit && frame <= wow_teb->Tib.StackBase)
+            return !(frame & (sizeof(ULONG) - 1));
+    }
+#endif
+    return FALSE;
+}
+
+static inline BOOL is_valid_stack_guarantee_frame( ULONG_PTR frame, ULONG_PTR stack_limit, ULONG_PTR stack_base,
+                                                   ULONG_PTR deallocation_stack, ULONG_PTR guaranteed_stack_bytes,
+                                                   ULONG_PTR alignment )
+{
+    ULONG_PTR guarantee_size;
+
+    if (frame >= stack_limit && frame <= stack_base)
+        return !(frame & (alignment - 1));
+
+    if (!deallocation_stack || frame >= stack_limit || stack_limit <= deallocation_stack)
+        return FALSE;
+
+    guarantee_size = guaranteed_stack_bytes > page_size ? guaranteed_stack_bytes : page_size;
+    if (guarantee_size > stack_limit - deallocation_stack)
+        guarantee_size = stack_limit - deallocation_stack;
+
+    return frame >= stack_limit - guarantee_size && !(frame & (alignment - 1));
+}
+
+static inline BOOL is_valid_frame_or_stack_guarantee( ULONG_PTR frame )
+{
+    TEB *teb = NtCurrentTeb();
+
+    if (is_valid_stack_guarantee_frame( frame, (ULONG_PTR)teb->Tib.StackLimit,
+            (ULONG_PTR)teb->Tib.StackBase, (ULONG_PTR)teb->DeallocationStack,
+            teb->GuaranteedStackBytes, sizeof(void *) ))
+        return TRUE;
+
+#ifdef _WIN64
+    if (teb->WowTebOffset)
+    {
+        TEB32 *wow_teb = (TEB32 *)((char *)teb + teb->WowTebOffset);
+
+        if (is_valid_stack_guarantee_frame( frame, wow_teb->Tib.StackLimit,
+                wow_teb->Tib.StackBase, wow_teb->DeallocationStack,
+                wow_teb->GuaranteedStackBytes, sizeof(ULONG) ))
+            return TRUE;
+    }
+#endif
+    return FALSE;
 }
 
 extern void WINAPI LdrInitializeThunk(CONTEXT*,ULONG_PTR,ULONG_PTR,ULONG_PTR);
@@ -82,6 +131,7 @@ extern void (WINAPI *pWow64PrepareForException)( EXCEPTION_RECORD *rec, CONTEXT 
 /* debug helpers */
 extern LPCSTR debugstr_us( const UNICODE_STRING *str );
 extern void set_native_thread_name( DWORD tid, const char *name );
+extern UINT64 ntdll_get_wow64_native_address( const void *address );
 
 /* init routines */
 extern void loader_init( CONTEXT *context, void **entry );
@@ -100,7 +150,6 @@ extern FARPROC SNOOP_GetProcAddress( HMODULE hmod, const IMAGE_EXPORT_DIRECTORY 
 extern void RELAY_SetupDLL( HMODULE hmod );
 extern void SNOOP_SetupDLL( HMODULE hmod );
 extern const WCHAR windows_dir[];
-extern const WCHAR system_dir[];
 
 extern void (FASTCALL *pBaseThreadInitThunk)(DWORD,LPTHREAD_START_ROUTINE,void *);
 
@@ -143,7 +192,7 @@ extern void heap_thread_detach(void);
     TRACE( "rax=%016I64x rbx=%016I64x rcx=%016I64x rdx=%016I64x\n", (c)->Rax, (c)->Rbx, (c)->Rcx, (c)->Rdx ); \
     TRACE( "rsi=%016I64x rdi=%016I64x  r8=%016I64x  r9=%016I64x\n", (c)->Rsi, (c)->Rdi, (c)->R8, (c)->R9 ); \
     TRACE( "r10=%016I64x r11=%016I64x r12=%016I64x r13=%016I64x\n", (c)->R10, (c)->R11, (c)->R12, (c)->R13 ); \
-    TRACE( "r14=%016I64x r15=%016I64x mxcsr=%08lx\n", (c)->R14, (c)->R15, (c)->MxCsr ); \
+    TRACE( "r14=%016I64x r15=%016I64x mxcsr=%08lx cs=%04x ss=%04x\n", (c)->R14, (c)->R15, (c)->MxCsr, (c)->SegCs, (c)->SegSs ); \
     } while(0)
 #elif defined(__arm__)
 # define TRACE_CONTEXT(c) do { \

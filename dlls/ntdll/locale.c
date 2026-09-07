@@ -23,7 +23,6 @@
 #include <stdlib.h>
 
 #include "ntstatus.h"
-#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winnls.h"
@@ -166,18 +165,18 @@ void locale_init(void)
 
     NtGetNlsSectionPtr( 10, 0, NULL, &case_ptr, &size );
     NtCurrentTeb()->Peb->UnicodeCaseTableData = case_ptr;
-    if (peb64) peb64->UnicodeCaseTableData = PtrToUlong( case_ptr );
+    if (peb64) peb64->UnicodeCaseTableData = ntdll_get_wow64_native_address( case_ptr );
     if (ansi_cp != CP_UTF8)
     {
         NtGetNlsSectionPtr( 11, ansi_cp, NULL, &ansi_ptr, &size );
         NtCurrentTeb()->Peb->AnsiCodePageData = ansi_ptr;
-        if (peb64) peb64->AnsiCodePageData = PtrToUlong( ansi_ptr );
+        if (peb64) peb64->AnsiCodePageData = ntdll_get_wow64_native_address( ansi_ptr );
     }
     if (oem_cp != CP_UTF8)
     {
         NtGetNlsSectionPtr( 11, oem_cp, NULL, &oem_ptr, &size );
         NtCurrentTeb()->Peb->OemCodePageData = oem_ptr;
-        if (peb64) peb64->OemCodePageData = PtrToUlong( oem_ptr );
+        if (peb64) peb64->OemCodePageData = ntdll_get_wow64_native_address( oem_ptr );
     }
     RtlInitNlsTables( ansi_ptr, oem_ptr, case_ptr, &nls_info );
     NlsAnsiCodePage     = nls_info.AnsiTableInfo.CodePage;

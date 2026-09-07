@@ -28,14 +28,12 @@
 #include <stdarg.h>
 
 #include "ntstatus.h"
-#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winternl.h"
 
 #include "file.h"
 #include "handle.h"
 #include "request.h"
-#include "msync.h"
 
 static const WCHAR timer_name[] = {'T','i','m','e','r'};
 
@@ -54,6 +52,7 @@ struct type_descr timer_type =
 struct timer
 {
     struct object        obj;       /* object header */
+    struct object       *sync;      /* sync object for wait/signal */
     int                  manual;    /* manual reset */
     int                  signaled;  /* current signaled state */
     unsigned int         period;    /* timer period in ms */
@@ -62,13 +61,10 @@ struct timer
     struct thread       *thread;    /* thread that set the APC function */
     client_ptr_t         callback;  /* callback APC function */
     client_ptr_t         arg;       /* callback argument */
-    unsigned int         msync_idx; /* msync shm index */
 };
 
 static void timer_dump( struct object *obj, int verbose );
-static int timer_signaled( struct object *obj, struct wait_queue_entry *entry );
-static unsigned int timer_get_msync_idx( struct object *obj, enum msync_type *type );
-static void timer_satisfied( struct object *obj, struct wait_queue_entry *entry );
+static struct object *timer_get_sync( struct object *obj );
 static void timer_destroy( struct object *obj );
 
 static const struct object_ops timer_ops =
@@ -76,13 +72,13 @@ static const struct object_ops timer_ops =
     sizeof(struct timer),      /* size */
     &timer_type,               /* type */
     timer_dump,                /* dump */
-    add_queue,                 /* add_queue */
-    remove_queue,              /* remove_queue */
-    timer_signaled,            /* signaled */
-    timer_get_msync_idx,       /* get_msync_idx */
-    timer_satisfied,           /* satisfied */
+    NULL,                      /* add_queue */
+    NULL,                      /* remove_queue */
+    NULL,                      /* signaled */
+    NULL,                      /* satisfied */
     no_signal,                 /* signal */
     no_get_fd,                 /* get_fd */
+    timer_get_sync,            /* get_sync */
     default_map_access,        /* map_access */
     default_get_sd,            /* get_sd */
     default_set_sd,            /* set_sd */
@@ -108,15 +104,19 @@ static struct timer *create_timer( struct object *root, const struct unicode_str
         if (get_error() != STATUS_OBJECT_NAME_EXISTS)
         {
             /* initialize it if it didn't already exist */
+            timer->sync     = NULL;
             timer->manual   = manual;
             timer->signaled = 0;
             timer->when     = 0;
             timer->period   = 0;
             timer->timeout  = NULL;
             timer->thread   = NULL;
-            if (do_msync())
-                timer->msync_idx = msync_alloc_shm( 0, 0 );
 
+            if (!(timer->sync = create_internal_sync( manual, 0 )))
+            {
+                release_object( timer );
+                return NULL;
+            }
         }
     }
     return timer;
@@ -135,6 +135,7 @@ static void timer_callback( void *private )
         assert (timer->callback);
         memset( &data, 0, sizeof(data) );
         data.type         = APC_USER;
+        data.user.flags   = 0;
         data.user.func    = timer->callback;
         data.user.args[0] = timer->arg;
         data.user.args[1] = (unsigned int)timer->when;
@@ -155,9 +156,8 @@ static void timer_callback( void *private )
     }
     else timer->timeout = NULL;
 
-    /* wake up waiters */
     timer->signaled = 1;
-    wake_up( &timer->obj, 0 );
+    signal_sync( timer->sync );
 }
 
 /* cancel a running timer */
@@ -188,9 +188,7 @@ static int set_timer( struct timer *timer, timeout_t expire, unsigned int period
     {
         period = 0;  /* period doesn't make any sense for a manual timer */
         timer->signaled = 0;
-
-        if (do_msync())
-            msync_clear( &timer->obj );
+        reset_sync( timer->sync );
     }
     timer->when     = (expire <= 0) ? expire - monotonic_time : max( expire, current_time );
     timer->period   = period;
@@ -211,25 +209,11 @@ static void timer_dump( struct object *obj, int verbose )
              timer->manual, get_timeout_str(timeout), timer->period );
 }
 
-static int timer_signaled( struct object *obj, struct wait_queue_entry *entry )
+static struct object *timer_get_sync( struct object *obj )
 {
     struct timer *timer = (struct timer *)obj;
     assert( obj->ops == &timer_ops );
-    return timer->signaled;
-}
-
-static unsigned int timer_get_msync_idx( struct object *obj, enum msync_type *type )
-{
-    struct timer *timer = (struct timer *)obj;
-    *type = timer->manual ? MSYNC_MANUAL_SERVER : MSYNC_AUTO_SERVER;
-    return timer->msync_idx;
-}
-
-static void timer_satisfied( struct object *obj, struct wait_queue_entry *entry )
-{
-    struct timer *timer = (struct timer *)obj;
-    assert( obj->ops == &timer_ops );
-    if (!timer->manual) timer->signaled = 0;
+    return grab_object( timer->sync );
 }
 
 static void timer_destroy( struct object *obj )
@@ -239,8 +223,7 @@ static void timer_destroy( struct object *obj )
 
     if (timer->timeout) remove_timeout_user( timer->timeout );
     if (timer->thread) release_object( timer->thread );
-    if (do_msync())
-        msync_destroy_semaphore( timer->msync_idx );
+    if (timer->sync) release_object( timer->sync );
 }
 
 /* create a timer */

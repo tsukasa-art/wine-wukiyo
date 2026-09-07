@@ -1,0 +1,4 @@
+TESTDLL = xtajit64.dll
+
+SOURCES = \
+	provider.c

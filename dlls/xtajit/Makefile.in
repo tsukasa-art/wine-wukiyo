@@ -1,0 +1,12 @@
+MODULE    = xtajit.dll
+UNIXLIB   = $(XTAJIT_UNIXLIB)
+IMPORTS   = wow64 ntdll
+EXTRADEFS = -D_CRTIMP= $(XTAJIT_PE_CFLAGS)
+UNIX_CFLAGS = $(UNICORN_CFLAGS) $(XTAJIT_PE_CFLAGS)
+UNIX_LIBS   = $(UNICORN_LIBS)
+
+EXTRADLLFLAGS = -nodefaultlibs
+
+SOURCES = \
+	cpu.c \
+	unixlib.c

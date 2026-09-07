@@ -1,8 +1,12 @@
 MODULE    = xtajit64.dll
-IMPORTS   = ntdll winecrt0
-EXTRADEFS = -D_CRTIMP=
+UNIXLIB   = $(XTAJIT64_UNIXLIB)
+IMPORTS   = ntdll
+EXTRADEFS = -D_CRTIMP= $(XTAJIT64_PE_CFLAGS)
+UNIX_CFLAGS = $(UNICORN_CFLAGS) $(XTAJIT64_PE_CFLAGS)
+UNIX_LIBS   = $(UNICORN_LIBS)
 
 EXTRADLLFLAGS = -nodefaultlibs
 
 SOURCES = \
-	cpu.c
+	cpu.c \
+	unixlib.c

@@ -24,7 +24,6 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include "ntstatus.h"
-#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winioctl.h"
 #include "winbase.h"
@@ -121,5 +120,6 @@ struct wine_device
 {
     DEVICE_OBJECT device_obj;
     DEVICE_RELATIONS *children;
+    HKEY dyn_data_key;
 };
 #endif

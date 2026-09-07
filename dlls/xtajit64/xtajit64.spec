@@ -18,3 +18,5 @@
 @ stdcall ThreadInit()
 @ stdcall ThreadTerm(ptr long)
 @ stdcall UpdateProcessorInformation(ptr)
+@ stdcall ResyncIdentityMemoryMappings()
+@ stdcall ResyncIdentityMemoryMappingsStatus()

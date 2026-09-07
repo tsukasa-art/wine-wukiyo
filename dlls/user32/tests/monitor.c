@@ -38,6 +38,8 @@
 #include <stdio.h>
 #include <math.h>
 
+#define HIMETRIC_PER_INCH 2540
+
 DEFINE_DEVPROPKEY(DEVPROPKEY_MONITOR_GPU_LUID, 0xca085853, 0x16ce, 0x48aa, 0xb1, 0x14, 0xde, 0x9c, 0x72, 0x33, 0x42, 0x23, 1);
 DEFINE_DEVPROPKEY(DEVPROPKEY_MONITOR_OUTPUT_ID, 0xca085853, 0x16ce, 0x48aa, 0xb1, 0x14, 0xde, 0x9c, 0x72, 0x33, 0x42, 0x23, 2);
 
@@ -1982,6 +1984,7 @@ static void test_QueryDisplayConfig_result(UINT32 flags,
     DISPLAYCONFIG_TARGET_DEVICE_NAME target_name;
     DISPLAYCONFIG_TARGET_PREFERRED_MODE preferred_mode;
     DISPLAYCONFIG_ADAPTER_NAME adapter_name;
+    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO color_info;
     const DISPLAYCONFIG_DESKTOP_IMAGE_INFO *di;
 
     for (i = 0; i < paths; i++)
@@ -2024,15 +2027,22 @@ static void test_QueryDisplayConfig_result(UINT32 flags,
                 preferred_mode.width, preferred_mode.height);
         check_preferred_mode(&preferred_mode, source_name.viewGdiDeviceName);
 
-        todo_wine {
         adapter_name.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME;
         adapter_name.header.size = sizeof(adapter_name);
         adapter_name.header.adapterId = pi[i].sourceInfo.adapterId;
+        adapter_name.header.id = ~0u;
         adapter_name.adapterDevicePath[0] = '\0';
         ret = pDisplayConfigGetDeviceInfo(&adapter_name.header);
         ok(!ret, "Expected 0, got %ld\n", ret);
         ok(adapter_name.adapterDevicePath[0] != '\0', "Expected adapter device path, got empty string\n");
-        }
+
+        color_info.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+        color_info.header.size = sizeof(color_info);
+        color_info.header.adapterId = pi[i].targetInfo.adapterId;
+        color_info.header.id = pi[i].targetInfo.id;
+        ret = pDisplayConfigGetDeviceInfo(&color_info.header);
+        ok(!ret || broken(ret == ERROR_INVALID_PARAMETER) /* before Win10 1709 */,
+                "Expected 0, got %ld\n", ret);
 
         /* Check corresponding modes */
         if (flags & QDC_VIRTUAL_MODE_AWARE)
@@ -2288,6 +2298,7 @@ static void test_DisplayConfigGetDeviceInfo(void)
     DISPLAYCONFIG_TARGET_DEVICE_NAME target_name;
     DISPLAYCONFIG_TARGET_PREFERRED_MODE preferred_mode;
     DISPLAYCONFIG_ADAPTER_NAME adapter_name;
+    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO color_info;
 
     ret = pDisplayConfigGetDeviceInfo(NULL);
     ok(ret == ERROR_GEN_FAILURE, "got %ld\n", ret);
@@ -2366,6 +2377,18 @@ static void test_DisplayConfigGetDeviceInfo(void)
     adapter_name.header.adapterId.LowPart = 0xFFFF;
     adapter_name.header.adapterId.HighPart = 0xFFFF;
     ret = pDisplayConfigGetDeviceInfo(&adapter_name.header);
+    ok(ret == ERROR_GEN_FAILURE || ret == ERROR_INVALID_PARAMETER || ret == ERROR_NOT_SUPPORTED, "got %ld\n", ret);
+
+    color_info.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+    color_info.header.size = sizeof(color_info) - 1;
+    ret = pDisplayConfigGetDeviceInfo(&color_info.header);
+    ok(ret == ERROR_INVALID_PARAMETER, "got %ld\n", ret);
+
+    color_info.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+    color_info.header.size = sizeof(color_info);
+    color_info.header.adapterId.LowPart = 0xFFFF;
+    color_info.header.adapterId.HighPart = 0xFFFF;
+    ret = pDisplayConfigGetDeviceInfo(&color_info.header);
     ok(ret == ERROR_GEN_FAILURE || ret == ERROR_INVALID_PARAMETER || ret == ERROR_NOT_SUPPORTED, "got %ld\n", ret);
 }
 
@@ -3196,7 +3219,7 @@ static void test_monitor_dpi_awareness( const struct monitor_info *infos, UINT c
         DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED,
         (DPI_AWARENESS_CONTEXT)0x7811,
     };
-    RECT virtual = {0}, scaled_virtual = {0}, monitor = {0}, scaled = {0}, primary = {0}, rect, expect_rect;
+    RECT virtual = {0}, scaled_virtual = {0}, monitor = {0}, scaled = {0}, primary = {0}, rect, expect_rect, device, scaled_device, expect_device;
     struct monitor_info tmp_info = {.handle = info->handle};
     UINT ret, i, x, y, expect_width, expect_height;
     HWND unaware_hwnd, aware_hwnd, primary_hwnd;
@@ -3212,16 +3235,26 @@ static void test_monitor_dpi_awareness( const struct monitor_info *infos, UINT c
     {
         if (infos[i].rect.left == 0 && infos[i].rect.top == 0) primary = infos[i].rect;
 
-        if (info - infos + i) UnionRect( &scaled_virtual, &scaled_virtual, &infos[i].rect );
+        SetRect( &device, infos[i].rect.left * HIMETRIC_PER_INCH / system_dpi, infos[i].rect.top * HIMETRIC_PER_INCH / system_dpi,
+                 infos[i].rect.right * HIMETRIC_PER_INCH / system_dpi, infos[i].rect.bottom * HIMETRIC_PER_INCH / system_dpi );
+        UnionRect( &virtual, &virtual, &infos[i].rect );
+        UnionRect( &expect_device, &expect_device, &device );
+
+        if (info != infos + i)
+        {
+            UnionRect( &scaled_virtual, &scaled_virtual, &infos[i].rect );
+            UnionRect( &scaled_device, &scaled_device, &device );
+        }
         else
         {
             scaled = monitor = infos[i].rect;
             scaled.right = scaled.left + MulDiv( scaled.right - scaled.left, 100, scale );
             scaled.bottom = scaled.top + MulDiv( scaled.bottom - scaled.top, 100, scale );
             UnionRect( &scaled_virtual, &scaled_virtual, &scaled );
+            SetRect( &device, scaled.left * HIMETRIC_PER_INCH / system_dpi, scaled.top * HIMETRIC_PER_INCH / system_dpi,
+                     scaled.right * HIMETRIC_PER_INCH / system_dpi, scaled.bottom * HIMETRIC_PER_INCH / system_dpi );
+            UnionRect( &scaled_device, &scaled_device, &device );
         }
-
-        UnionRect( &virtual, &virtual, &infos[i].rect );
     }
 
     unaware_hwnd = CreateWindowW( L"static", NULL, WS_POPUP | WS_VISIBLE, monitor.left + 100,
@@ -3257,6 +3290,12 @@ static void test_monitor_dpi_awareness( const struct monitor_info *infos, UINT c
 
     check_logical_physical_dpi( unaware_hwnd, monitor.left + 2 * scale + 1, monitor.top + 2 * scale + 1,
                                 monitor.left + 2 * scale + 1, monitor.top + 2 * scale + 1, FALSE );
+
+    ret = GetPointerDeviceRects( INVALID_HANDLE_VALUE, &device, &rect );
+    ok( ret, "GetPointerDeviceRects failed, error %lu.\n", GetLastError() );
+    ok( EqualRect( &rect, &scaled_virtual ), "got %s\n", wine_dbgstr_rect(&rect) );
+    ok( EqualRect( &device, &expect_device ) /* w10 */ || EqualRect( &device, &scaled_device ) /* w11 */,
+        "got %s vs %s / %s\n", wine_dbgstr_rect(&device), wine_dbgstr_rect(&expect_device), wine_dbgstr_rect(&scaled_device) );
 
     for (i = 0; i < ARRAY_SIZE(tests); i++)
     {
@@ -3544,6 +3583,12 @@ static void test_monitor_dpi_awareness( const struct monitor_info *infos, UINT c
         check_logical_physical_dpi( primary_hwnd, primary.left + 4 * scale + 1, primary.top + 4 * scale + 1,
                                     primary.left + 4 * scale + 1, primary.top + 4 * scale + 1, FALSE );
 
+        ret = GetPointerDeviceRects( INVALID_HANDLE_VALUE, &device, &rect );
+        ok( ret, "GetPointerDeviceRects failed, error %lu.\n", GetLastError() );
+        ok( EqualRect( &rect, monitor_aware ? &virtual : &scaled_virtual ), "got %s\n", wine_dbgstr_rect(&rect) );
+        ok( EqualRect( &device, &expect_device ) /* w10 */ || EqualRect( &device, &scaled_device ) /* w11 */,
+            "got %s vs %s / %s\n", wine_dbgstr_rect(&device), wine_dbgstr_rect(&expect_device), wine_dbgstr_rect(&scaled_device) );
+
         DestroyWindow( primary_hwnd );
         DestroyWindow( aware_hwnd );
 
@@ -3609,6 +3654,7 @@ static void test_monitor_dpi(void)
         {1024, 768},
     };
     UINT i, j, count, system_dpi, dpi_x, dpi_y;
+    RECT expect_rect, device, display;
     DPI_AWARENESS_CONTEXT old_ctx;
     float scale_x, scale_y;
     BOOL ret, is_virtual;
@@ -3639,11 +3685,14 @@ static void test_monitor_dpi(void)
     {
         for (j = 0; j < ARRAY_SIZE(tests); j++)
         {
+            RECT virtual = {0};
+
             if (tests[j].width && tests[j].height && !set_display_settings( infos[i].handle, tests[j].width, tests[j].height )) continue;
 
             get_monitor_infos( infos ); /* refresh infos as changing display settings may invalidate HMONITOR */
             scale_x = (infos[i].rect.right - infos[i].rect.left) / (float)(phys_infos[i].rect.right - phys_infos[i].rect.left);
             scale_y = (infos[i].rect.bottom - infos[i].rect.top) / (float)(phys_infos[i].rect.bottom - phys_infos[i].rect.top);
+            for (UINT i = 0; i < count; i++) UnionRect( &virtual, &virtual, &infos[i].rect );
 
             ret = pGetDpiForMonitorInternal( infos[i].handle, MDT_EFFECTIVE_DPI, &dpi_x, &dpi_y );
             ok( ret, "GetDpiForMonitorInternal failed, error %lu\n", GetLastError() );
@@ -3682,6 +3731,13 @@ static void test_monitor_dpi(void)
                 todo_wine_if(scale_y != 1.0)
                 ok( fabs( dpi_y - system_dpi * scale_y ) < system_dpi * 0.05, "got MDT_RAW_DPI y %u\n", dpi_y );
             }
+
+            ret = GetPointerDeviceRects( INVALID_HANDLE_VALUE, &device, &display );
+            ok( ret, "GetPointerDeviceRects failed, error %lu.\n", GetLastError() );
+            ok( EqualRect( &display, &virtual ), "got %s\n", wine_dbgstr_rect( &display ) );
+            SetRect( &expect_rect, 0, 0, virtual.right * HIMETRIC_PER_INCH / system_dpi,
+                     virtual.bottom * HIMETRIC_PER_INCH / system_dpi );
+            ok( EqualRect( &device, &expect_rect ), "got %s\n", wine_dbgstr_rect( &device ) );
 
             pSetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 );
 
@@ -3723,6 +3779,13 @@ static void test_monitor_dpi(void)
                 ok( fabs( dpi_y - system_dpi * scale_y ) < system_dpi * 0.05, "got MDT_RAW_DPI y %u\n", dpi_y );
             }
 
+            ret = GetPointerDeviceRects( INVALID_HANDLE_VALUE, &device, &display );
+            ok( ret, "GetPointerDeviceRects failed, error %lu.\n", GetLastError() );
+            ok( EqualRect( &display, &virtual ), "got %s\n", wine_dbgstr_rect( &display ) );
+            SetRect( &expect_rect, 0, 0, virtual.right * HIMETRIC_PER_INCH / system_dpi,
+                     virtual.bottom * HIMETRIC_PER_INCH / system_dpi );
+            ok( EqualRect( &device, &expect_rect ), "got %s\n", wine_dbgstr_rect( &device ) );
+
             pSetThreadDpiAwarenessContext( old_ctx );
         }
     }
@@ -3734,7 +3797,10 @@ static void test_monitor_dpi(void)
     {
         int min = 0, max = 0, cur = 0;
 
-        set_display_settings( infos[i].handle, 800, 600 );
+        /* native disables DPI scaling when resolution is below 1024x768, but Wine default CI resolution is 1024x768 */
+        if (winetest_platform_is_wine) set_display_settings( infos[i].handle, 800, 600 );
+        else set_display_settings( infos[i].handle, 1024, 768 );
+
         get_monitor_infos( infos ); /* refresh infos as changing display settings may invalidate HMONITOR */
 
         get_monitor_dpi_scale( infos[i].handle, &min, &cur, &max );
