@@ -171,6 +171,12 @@ static void dump_init_thread_reply( const struct init_thread_reply *req )
     fprintf( stderr, " suspend=%d", req->suspend );
 }
 
+static void dump_process_exit_batch_request( const struct process_exit_batch_request *req )
+{
+    fprintf( stderr, " operation=%d", req->operation );
+    fprintf( stderr, ", exit_code=%d", req->exit_code );
+}
+
 static void dump_terminate_process_request( const struct terminate_process_request *req )
 {
     fprintf( stderr, " handle=%04x", req->handle );
@@ -3567,6 +3573,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_init_process_done_request,
     (dump_func)dump_init_first_thread_request,
     (dump_func)dump_init_thread_request,
+    (dump_func)dump_process_exit_batch_request,
     (dump_func)dump_terminate_process_request,
     (dump_func)dump_prepare_thread_termination_request,
     (dump_func)dump_finish_thread_termination_request,
@@ -3881,6 +3888,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_init_process_done_reply,
     (dump_func)dump_init_first_thread_reply,
     (dump_func)dump_init_thread_reply,
+    NULL,
     (dump_func)dump_terminate_process_reply,
     (dump_func)dump_prepare_thread_termination_reply,
     NULL,
@@ -4195,6 +4203,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "init_process_done",
     "init_first_thread",
     "init_thread",
+    "process_exit_batch",
     "terminate_process",
     "prepare_thread_termination",
     "finish_thread_termination",
@@ -4626,6 +4635,7 @@ static const struct
     { "PIPE_LISTENING",              STATUS_PIPE_LISTENING },
     { "PIPE_NOT_AVAILABLE",          STATUS_PIPE_NOT_AVAILABLE },
     { "PORT_NOT_SET",                STATUS_PORT_NOT_SET },
+    { "POSSIBLE_DEADLOCK",           STATUS_POSSIBLE_DEADLOCK },
     { "PREDEFINED_HANDLE",           STATUS_PREDEFINED_HANDLE },
     { "PRIVILEGE_NOT_HELD",          STATUS_PRIVILEGE_NOT_HELD },
     { "PROCESS_IN_JOB",              STATUS_PROCESS_IN_JOB },

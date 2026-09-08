@@ -678,6 +678,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->page_size       = get_page_size();
     process->unix_pid        = -1;
     process->exit_code       = STILL_ACTIVE;
+    process->exit_preparation_owner = NULL;
     process->running_threads = 0;
     process->user_threads    = 0;
     process->priority        = PROCESS_PRIOCLASS_NORMAL;

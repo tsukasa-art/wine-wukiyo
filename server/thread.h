@@ -88,6 +88,7 @@ struct thread
     int                    base_priority; /* base priority level (relative to process base priority class) */
     int                    disable_boost; /* disable thread priority boost */
     int                    suspend;       /* suspend count */
+    struct process_termination *process_termination; /* owned batch preparation */
     obj_handle_t           termination_context; /* server-owned wait handle */
     struct thread         *termination_target; /* owned preparation, referenced */
     struct thread         *termination_owner;  /* private stop, not suspend count */

@@ -3962,8 +3962,13 @@ void WINAPI RtlExitUserProcess( DWORD status )
 {
     RtlEnterCriticalSection( &loader_section );
     RtlAcquirePebLock();
-    NtTerminateProcess( 0, status );
-    LdrShutdownProcess();
+    /* DLL detach requires all peer threads to have stopped. A failed
+     * preparation must not run detach concurrently with live guest code. */
+    {
+        NTSTATUS ret = NtTerminateProcess( 0, status );
+        if (!ret) LdrShutdownProcess();
+        else status = ret;
+    }
     for (;;) NtTerminateProcess( GetCurrentProcess(), status );
 }
 

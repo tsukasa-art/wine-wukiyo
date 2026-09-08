@@ -959,6 +959,54 @@ done:
 }
 
 
+#if defined(__aarch64__)
+static BOOL use_process_exit_guard(void)
+{
+    static LONG enabled = -1;
+    LONG value = InterlockedCompareExchange( &enabled, -1, -1 );
+    if (value == -1)
+    {
+        const char *option = getenv( "ORRERY_ARM64EC_PROCESS_EXIT_GUARD" );
+        value = option && !strcmp( option, "1" );
+        InterlockedCompareExchange( &enabled, value, -1 );
+    }
+    return is_arm64ec() && value;
+}
+
+static NTSTATUS process_exit_batch_call( int operation, LONG exit_code )
+{
+    NTSTATUS status;
+    SERVER_START_REQ( process_exit_batch )
+    {
+        req->operation = operation;
+        req->exit_code = exit_code;
+        status = wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    return status;
+}
+
+static NTSTATUS prepare_process_exit( LONG exit_code )
+{
+    NTSTATUS status;
+    LARGE_INTEGER start, now, frequency, interval;
+    if ((status = process_exit_batch_call( 0, exit_code ))) return status;
+    NtQueryPerformanceCounter( &start, &frequency );
+    interval.QuadPart = -100000; /* 10ms; one shared two-second budget. */
+    for (;;)
+    {
+        status = process_exit_batch_call( 1, exit_code );
+        if (status != STATUS_PENDING) break;
+        NtQueryPerformanceCounter( &now, NULL );
+        if (now.QuadPart - start.QuadPart >= 2 * frequency.QuadPart)
+        { status = STATUS_IO_TIMEOUT; break; }
+        if ((status = NtDelayExecution( FALSE, &interval ))) break;
+    }
+    if (status) process_exit_batch_call( 2, exit_code );
+    return status;
+}
+#endif
+
 /******************************************************************************
  *              NtTerminateProcess  (NTDLL.@)
  */
@@ -966,6 +1014,15 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
 {
     unsigned int ret;
     BOOL self;
+
+#if defined(__aarch64__)
+    if (!handle && use_process_exit_guard())
+    {
+        ret = prepare_process_exit( exit_code );
+        if (!ret) process_exiting = TRUE;
+        return ret;
+    }
+#endif
 
     SERVER_START_REQ( terminate_process )
     {

@@ -1209,6 +1209,12 @@ typedef volatile struct
 @END
 
 
+/* Current-process exit: prepare peers, poll/commit, or cancel. */
+@REQ(process_exit_batch)
+    int operation;
+    int exit_code;
+@END
+
 /* Terminate a process */
 @REQ(terminate_process)
     obj_handle_t handle;       /* process handle to terminate */

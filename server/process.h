@@ -54,6 +54,7 @@ struct process
     unsigned int         page_size;       /* client page size */
     int                  unix_pid;        /* Unix pid for final SIGKILL */
     int                  exit_code;       /* process exit code */
+    struct thread       *exit_preparation_owner; /* provisional process exit */
     int                  running_threads; /* number of threads running in this process */
     int                  user_threads;    /* number of user threads running in this process */
     timeout_t            start_time;      /* absolute time at process start */

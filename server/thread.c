@@ -139,6 +139,17 @@ struct context
 #define CTX_NATIVE  0  /* context for native machine */
 #define CTX_WOW     1  /* context if thread is inside WoW */
 
+struct process_termination_entry
+{
+    struct thread *thread;
+    struct context *context;
+};
+struct process_termination
+{
+    unsigned int count;
+    struct process_termination_entry entries[];
+};
+
 /* flags for registers that always need to be set from the server side */
 static const unsigned int system_flags = SERVER_CTX_DEBUG_REGISTERS;
 
@@ -404,6 +415,7 @@ static inline void init_thread_structure( struct thread *thread )
     thread->unix_pid        = -1;  /* not known yet */
     thread->unix_tid        = -1;  /* not known yet */
     thread->context         = NULL;
+    thread->process_termination = NULL;
     thread->termination_context = 0;
     thread->termination_target = NULL;
     thread->termination_owner = NULL;
@@ -531,7 +543,7 @@ struct thread *create_thread( int fd, struct process *process, const struct secu
         fd = request_pipe[0];
     }
 
-    if (process->is_terminating)
+    if (process->is_terminating || process->exit_preparation_owner)
     {
         close( fd );
         set_error( STATUS_PROCESS_IS_TERMINATING );
@@ -610,6 +622,26 @@ static struct list *thread_get_kernel_obj_list( struct object *obj )
     return &thread->kernel_object;
 }
 
+static void cancel_process_termination( struct thread *owner )
+{
+    struct process_termination *job = owner->process_termination;
+    unsigned int i;
+    if (!job) return;
+    owner->process_termination = NULL;
+    assert( owner->process->exit_preparation_owner == owner );
+    owner->process->exit_preparation_owner = NULL;
+    for (i = 0; i < job->count; ++i)
+    {
+        struct thread *target = job->entries[i].thread;
+        assert( target->termination_owner == owner );
+        target->termination_owner = NULL;
+        if (target->state != TERMINATED && !is_thread_suspended( target )) wake_thread( target );
+        if (job->entries[i].context) release_object( job->entries[i].context );
+        release_object( target );
+    }
+    free( job );
+}
+
 /* Only the preparing thread owns this stop; ordinary ResumeThread cannot
  * consume it. Clear both links before waking or dropping the target reference. */
 static void cancel_thread_termination( struct thread *owner )
@@ -634,6 +666,7 @@ static void cleanup_thread( struct thread *thread )
 {
     int i;
 
+    cancel_process_termination( thread );
     cancel_thread_termination( thread );
     cleanup_thread_completion( thread );
     if (thread->context)
@@ -1853,7 +1886,8 @@ static int termination_would_cycle( struct thread *owner, struct thread *target 
 DECL_HANDLER(prepare_thread_termination)
 {
     struct thread *thread;
-    if (current->termination_target) { set_error( STATUS_DEVICE_BUSY ); return; }
+    if (current->termination_target || current->process->exit_preparation_owner)
+    { set_error( STATUS_DEVICE_BUSY ); return; }
     if (!(thread = get_thread_from_handle( req->handle, THREAD_TERMINATE ))) return;
     if (thread == current) reply->self = 1;
     else if (thread->state == TERMINATED) set_error( STATUS_THREAD_IS_TERMINATING );
@@ -1900,6 +1934,84 @@ DECL_HANDLER(finish_thread_termination)
         }
     }
     cancel_thread_termination( current );
+}
+
+/* operation 0 prepares all peers, 1 commits only once all are quiescent,
+ * 2 cancels. The caller is the current process, so no external process handle
+ * or rights expansion is involved. All references survive target exit. */
+DECL_HANDLER(process_exit_batch)
+{
+    struct process *process = current->process;
+    struct process_termination *job = current->process_termination;
+    struct thread *thread;
+    unsigned int i;
+
+    if (req->operation == 2)
+    {
+        if (!job || process->exit_preparation_owner != current)
+        { set_error( STATUS_INVALID_DEVICE_STATE ); return; }
+        cancel_process_termination( current );
+        return;
+    }
+    if (req->operation > 2) { set_error( STATUS_INVALID_PARAMETER ); return; }
+    if (!req->operation)
+    {
+        if (native_machine != IMAGE_FILE_MACHINE_ARM64 || process->machine != IMAGE_FILE_MACHINE_AMD64)
+        { set_error( STATUS_NOT_SUPPORTED ); return; }
+        if (process->exit_preparation_owner || process->is_terminating)
+        { set_error( STATUS_DEVICE_BUSY ); return; }
+        LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
+            if (thread->termination_owner || thread->termination_target || thread->process_termination)
+            { set_error( STATUS_DEVICE_BUSY ); return; }
+        if (!(job = calloc( 1, sizeof(*job) + process->running_threads * sizeof(job->entries[0]) )))
+        { set_error( STATUS_NO_MEMORY ); return; }
+        current->process_termination = job;
+        process->exit_preparation_owner = current;
+        LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
+        {
+            struct process_termination_entry *entry;
+            if (thread == current || thread->state == TERMINATED) continue;
+            entry = &job->entries[job->count++];
+            entry->thread = (struct thread *)grab_object( thread );
+            thread->termination_owner = current;
+            stop_thread( thread );
+            if (!thread->context)
+            {
+                cancel_process_termination( current );
+                set_error( STATUS_NO_MEMORY );
+                return;
+            }
+            entry->context = (struct context *)grab_object( thread->context );
+        }
+        return;
+    }
+    if (!job) { set_error( STATUS_INVALID_DEVICE_STATE ); return; }
+    for (i = 0; i < job->count; ++i)
+    {
+        thread = job->entries[i].thread;
+        /* Death via another route does not prove that the provider returned
+         * its ownership before SIGQUIT. Never authorize DLL detach from it. */
+        if (thread->state == TERMINATED)
+        { set_error( STATUS_THREAD_IS_TERMINATING ); return; }
+        if (thread->context != job->entries[i].context)
+        { set_error( STATUS_INVALID_DEVICE_STATE ); return; }
+        if (thread->context->status && thread->context->status != STATUS_PENDING)
+        { set_error( thread->context->status ); return; }
+        if (thread->context->status || thread->context->cooperative)
+        { set_error( STATUS_PENDING ); return; }
+    }
+    /* From here onward there is no partial failure path: every peer has
+     * acknowledged its private stop before any peer is terminated. */
+    process->is_terminating = 1;
+    for (i = 0; i < job->count; ++i)
+    {
+        thread = job->entries[i].thread;
+        if (thread->state == TERMINATED) continue;
+        if (req->exit_code) thread->exit_code = req->exit_code;
+        kill_thread( thread, 1 );
+        cancel_terminating_thread_asyncs( thread );
+    }
+    cancel_process_termination( current );
 }
 
 /* terminate a thread */

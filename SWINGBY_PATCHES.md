@@ -254,3 +254,28 @@ and client artifacts and is tested only in an isolated prefix.
 This is disabled by default. It does not establish general process termination,
 cross-process termination, all concurrent context operations, or product runtime
 adoption. It complements the separately gated self-exit protection.
+
+
+### Experimental ARM64EC process-exit preparation
+
+`ORRERY_ARM64EC_PROCESS_EXIT_GUARD=1` adds a same-process, null-handle
+`NtTerminateProcess` preparation batch for ARM64EC. Before terminating any peer,
+the server privately stops and retains every peer, rejects new thread creation,
+and requires all captured contexts to acknowledge a non-cooperative stop. A peer
+that dies before acknowledgement is a failure, not proof of safe cleanup.
+The client polls with one shared two-second acknowledgement budget. Failure or
+requester cleanup releases the entire batch, including partial preparation,
+without consuming public suspend counts. Only an all-ready batch commits.
+
+`RtlExitUserProcess` now checks the preparation result: on failure it skips DLL
+process detach and uses the existing final hard-termination path with the failure
+status. On success the requester remains available for x64 DLL detach. The loader
+failure check is shared code; batch preparation itself is disabled by default.
+Final hard termination and termination through another process handle retain the
+existing path. Matching client/server protocol artifacts are required.
+
+Isolated tests cover active peers, detach-time memory protection, timeout
+rollback, thread-creation gating, requester death, and a captured peer exiting
+before acknowledgement. Controlled delay helpers are test fixtures, not runtime
+instrumentation. These results do not establish safety for arbitrary external
+forced termination, every context race, real games, or product adoption.

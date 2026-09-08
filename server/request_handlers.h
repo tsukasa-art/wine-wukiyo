@@ -14,6 +14,7 @@ DECL_HANDLER(get_startup_info);
 DECL_HANDLER(init_process_done);
 DECL_HANDLER(init_first_thread);
 DECL_HANDLER(init_thread);
+DECL_HANDLER(process_exit_batch);
 DECL_HANDLER(terminate_process);
 DECL_HANDLER(prepare_thread_termination);
 DECL_HANDLER(finish_thread_termination);
@@ -328,6 +329,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_init_process_done,
     (req_handler)req_init_first_thread,
     (req_handler)req_init_thread,
+    (req_handler)req_process_exit_batch,
     (req_handler)req_terminate_process,
     (req_handler)req_prepare_thread_termination,
     (req_handler)req_finish_thread_termination,
@@ -748,6 +750,9 @@ C_ASSERT( offsetof(struct init_thread_request, entry) == 32 );
 C_ASSERT( sizeof(struct init_thread_request) == 40 );
 C_ASSERT( offsetof(struct init_thread_reply, suspend) == 8 );
 C_ASSERT( sizeof(struct init_thread_reply) == 16 );
+C_ASSERT( offsetof(struct process_exit_batch_request, operation) == 12 );
+C_ASSERT( offsetof(struct process_exit_batch_request, exit_code) == 16 );
+C_ASSERT( sizeof(struct process_exit_batch_request) == 24 );
 C_ASSERT( offsetof(struct terminate_process_request, handle) == 12 );
 C_ASSERT( offsetof(struct terminate_process_request, exit_code) == 16 );
 C_ASSERT( sizeof(struct terminate_process_request) == 24 );
