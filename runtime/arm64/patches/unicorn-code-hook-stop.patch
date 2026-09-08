@@ -1,0 +1,20 @@
+--- a/qemu/target/i386/translate.c
++++ b/qemu/target/i386/translate.c
+@@ -4837,7 +4837,16 @@
+         insn_hook = true;
+         gen_uc_tracecode(tcg_ctx, 0xf1f1f1f1, UC_HOOK_CODE_IDX, env->uc, pc_start);
+ 
+-        check_exit_request(tcg_ctx);
++        /* The memory-fastpath exit check is intentionally elided by the
++         * Switchyard patch. A code hook can still request an immediate stop
++         * before this instruction (including a Wine syscall BOP) executes. */
++        {
++            TCGv_ptr puc = tcg_const_ptr(tcg_ctx, env->uc);
++            TCGv_i32 delay_slot = tcg_const_i32(tcg_ctx, 0);
++            gen_helper_check_exit_request(tcg_ctx, puc, delay_slot);
++            tcg_temp_free_i32(tcg_ctx, delay_slot);
++            tcg_temp_free_ptr(tcg_ctx, puc);
++        }
+ 
+         // Unicorn: Previous hook might change eflags to any state, let's sync it
+         gen_compute_eflags(s);

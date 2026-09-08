@@ -2,12 +2,18 @@
 
 [English](README.md)
 
+> **ARM64移行用の実験ブランチです。** `master`は既存のRosetta依存系統を維持します。
+> このブランチはWine 11.12系とARM64 CPU変換を統合する開発候補であり、そのまま
+> インストールできる完成版ではありません。[CPU依存の入力](runtime/arm64/README.md)を
+> 同梱していますが、runtime全体の再現可能なビルド手順は整備中です。
+
 **Swingby Wine**（repository: `swingby-wine`）は、Orreryの非公開ランチャー本体**Melammu**で利用する、
 Apple Silicon Mac向けの公開Wine forkです。Windows向けビジュアルノベルをゲーム本体の
 実行ファイルやデータを書き換えず、Macアプリとして扱うための互換処理を実装しています。
 
 [WineHQ Wine 10.0](https://gitlab.winehq.org/wine/wine)のrelease
-`b0738596`を直接のbaseとし、macOS / Rosetta 2向けのWine-side patchをこのrepoで
+`b0738596`から始まる履歴を継承し、この移行ブランチでは新しい基盤を統合しています。
+正確な基盤は[SWINGBY_PATCHES.md](SWINGBY_PATCHES.md)を参照してください。macOS向けのWine-side patchをこのrepoで
 管理します。runtime選択、bundle、署名、release policyは非公開Melammuの責任であり、
 ランチャー本体や配布用artifactはここに含みません。
 

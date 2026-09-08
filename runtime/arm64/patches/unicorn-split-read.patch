@@ -1,0 +1,14 @@
+--- a/qemu/accel/tcg/cputlb.c
++++ b/qemu/accel/tcg/cputlb.c
+@@ -1681,6 +1681,11 @@
+             tlb_addr &= ~TLB_INVALID_MASK;
+         }
+ 
++    }
++
++    /* Permission checks must also cover the second page of a split read.
++       Only duplicate observation hooks are suppressed during recursion. */
++    if (!code_read) {
+         // callback on non-readable memory
+         if (mr != NULL && !(mr->perms & UC_PROT_READ)) {  //non-readable
+             handled = false;

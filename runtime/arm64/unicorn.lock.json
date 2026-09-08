@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "scope": "Unicorn source inputs only; not a complete ARM64 Wine distribution recipe",
+  "unicorn": {
+    "commit": "8028ec436f2d9376525352dd38ed9ed6b9f6be10",
+    "url": "https://codeload.github.com/unicorn-engine/unicorn/tar.gz/8028ec436f2d9376525352dd38ed9ed6b9f6be10",
+    "archive_sha256": "9d2a2003f0307d0fc239af439654564fe6ef17b67f7c5a39b45fad4c69d6aec2",
+    "directory": "unicorn-8028ec436f2d9376525352dd38ed9ed6b9f6be10"
+  },
+  "patches_in_order": [
+    {
+      "path": "patches/unicorn-threaded-emu-stop.patch",
+      "sha256": "96a647d57f6f749c3c3864ead959c2e9306488151f5fed468e6ad334483e6cc5",
+      "origin": "https://github.com/jungwuk-ryu/switchyard-wine/blob/b861d8e260f933a76c17d5482bbbe376bb4ea51e/switchyard/patches/unicorn-2.1.4-threaded-emu-stop.patch"
+    },
+    {
+      "path": "patches/unicorn-split-read.patch",
+      "sha256": "5e241f66679d9edbb72ea5d2bbd3493ff6255549256286f36f134f31288dd118",
+      "origin": "Swingby local modification to pinned Unicorn sources"
+    },
+    {
+      "path": "patches/unicorn-code-hook-stop.patch",
+      "sha256": "84688dfdc6a448fadc2ff7cdb5946e16608f10c38dae343658c5585fe95db470",
+      "origin": "Swingby local modification to pinned Unicorn sources"
+    },
+    {
+      "path": "patches/unicorn-atomic-xchg.patch",
+      "sha256": "19b3dea36ee1536041bf7ff4ec03f2331e62e88fa245f72a29013d60f0959284",
+      "origin": "Swingby local modification to pinned Unicorn sources"
+    }
+  ],
+  "cmake_options": [
+    "-DCMAKE_BUILD_TYPE=Release",
+    "-DUNICORN_ARCH=x86",
+    "-DUNICORN_BUILD_TESTS=OFF",
+    "-DUNICORN_INSTALL=OFF",
+    "-DBUILD_SHARED_LIBS=ON"
+  ],
+  "remaining": [
+    "Wine configure/link/signing and SDK/toolchain input lock",
+    "DXVK exact source/build identification",
+    "MoltenVK and other native library input lock",
+    "prefix/runtime packaging"
+  ]
+}

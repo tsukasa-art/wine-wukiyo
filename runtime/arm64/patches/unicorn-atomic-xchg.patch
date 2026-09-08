@@ -1,0 +1,22 @@
+--- a/qemu/accel/tcg/atomic_template.h
++++ b/qemu/accel/tcg/atomic_template.h
+@@ -117,8 +117,7 @@
+     DATA_TYPE *haddr = ATOMIC_MMU_LOOKUP;
+     DATA_TYPE ret;
+ 
+-    ret = *haddr;
+-    *haddr = val;
++    ret = atomic_xchg__nocheck(haddr, val);
+     ATOMIC_MMU_CLEANUP;
+ 
+     return ret;
+@@ -260,8 +259,7 @@
+     ATOMIC_MMU_DECLS;
+     DATA_TYPE *haddr = ATOMIC_MMU_LOOKUP;
+     ABI_TYPE ret;
+-    ret = *haddr;
+-    *haddr = BSWAP(val);
++    ret = atomic_xchg__nocheck(haddr, BSWAP(val));
+     ATOMIC_MMU_CLEANUP;
+     return BSWAP(ret);
+ }

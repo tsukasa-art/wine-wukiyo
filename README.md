@@ -2,13 +2,19 @@
 
 [日本語](README.ja.md)
 
+> **Experimental ARM64 migration branch.** `master` remains the stable Rosetta-based
+> lineage. This branch integrates Wine 11.12-series code and ARM64 CPU-translation
+> support; it is not a ready-to-install replacement. The [CPU dependency inputs](runtime/arm64/README.md)
+> are versioned here, while a complete reproducible runtime build remains in progress.
+
 **Swingby Wine** (repository: `swingby-wine`) is the public Wine fork used by **Melammu**, the private
 launcher at the core of [Orrery](https://tsukasa-art.com/projects/orrery/).
 Orrery is a compatibility and library project for running Windows visual
 novels as Mac applications without modifying the games themselves.
 
-The fork is based directly on the [WineHQ](https://gitlab.winehq.org/wine/wine)
-**Wine 10.0 release** (`b0738596`). This repository is the canonical source for
+The stable lineage starts at the [WineHQ](https://gitlab.winehq.org/wine/wine)
+**Wine 10.0 release** (`b0738596`). This migration branch retains that history
+while integrating the newer baseline documented in [SWINGBY_PATCHES.md](SWINGBY_PATCHES.md). This repository is the canonical source for
 its Wine-side macOS and Rosetta compatibility patches. Runtime selection,
 packaging, signing, and release policy belong to the private Melammu project;
 the launcher and its release artifacts are not published here.
