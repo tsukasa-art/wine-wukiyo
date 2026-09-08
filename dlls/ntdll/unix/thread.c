@@ -1105,6 +1105,24 @@ static void contexts_from_server( CONTEXT *context, struct context_data server_c
  * This does not protect arbitrary worker execution or block synchronous I/O.
  * Successful self-termination never returns: native exit and TLS destructors
  * retain the mask. A failed termination restores exactly the previous mask. */
+static NTSTATUS notify_self_exit_phase( unsigned int operation )
+{
+#if defined(__aarch64__)
+    const char *option = getenv( "ORRERY_ARM64EC_PROCESS_EXIT_GUARD" );
+    if (is_arm64ec() && option && !strcmp( option, "1" ))
+    {
+        SERVER_START_REQ( process_exit_batch )
+        {
+            req->operation = operation;
+            req->exit_code = 0;
+            return wine_server_call( req );
+        }
+        SERVER_END_REQ;
+    }
+#endif
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS unixcall_thread_exit_guard( void *args )
 {
     static LONG enabled = -1;
@@ -1113,10 +1131,11 @@ NTSTATUS unixcall_thread_exit_guard( void *args )
     const char *value;
     sigset_t mask;
     ULONG enable;
+    NTSTATUS status;
 
     if (!args || !data) return STATUS_INVALID_PARAMETER;
     enable = *(const ULONG *)args;
-    if (enable > 1) return STATUS_INVALID_PARAMETER;
+    if (enable > 2) return STATUS_INVALID_PARAMETER;
     if (current == -1)
     {
         value = getenv( "ORRERY_ARM64EC_EXIT_GUARD" );
@@ -1124,6 +1143,12 @@ NTSTATUS unixcall_thread_exit_guard( void *args )
         InterlockedCompareExchange( &enabled, current, -1 );
     }
     if (!current) return STATUS_SUCCESS;
+    if (enable == 2)
+    {
+        if (!data->exit_guard_active) return STATUS_INVALID_DEVICE_STATE;
+        data->exit_cleanup_ready = TRUE;
+        return STATUS_SUCCESS;
+    }
     if (enable)
     {
         if (data->exit_guard_active) return STATUS_INVALID_DEVICE_STATE;
@@ -1131,14 +1156,23 @@ NTSTATUS unixcall_thread_exit_guard( void *args )
         sigaddset( &mask, SIGQUIT );
         if (pthread_sigmask( SIG_BLOCK, &mask, &data->exit_guard_mask ))
             return STATUS_UNSUCCESSFUL;
+        if ((status = notify_self_exit_phase( 4 )))
+        {
+            if (pthread_sigmask( SIG_SETMASK, &data->exit_guard_mask, NULL ))
+                return STATUS_UNSUCCESSFUL;
+            return status;
+        }
         data->exit_guard_active = TRUE;
+        data->exit_cleanup_ready = FALSE;
     }
     else
     {
         if (!data->exit_guard_active) return STATUS_INVALID_DEVICE_STATE;
+        if ((status = notify_self_exit_phase( 5 ))) return status;
         if (pthread_sigmask( SIG_SETMASK, &data->exit_guard_mask, NULL ))
             return STATUS_UNSUCCESSFUL;
         data->exit_guard_active = FALSE;
+        data->exit_cleanup_ready = FALSE;
     }
     return STATUS_SUCCESS;
 }
@@ -1219,6 +1253,23 @@ NTSTATUS unixcall_deferred_vm_notification( void *args )
 static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
 {
     struct thread_data *data = get_thread_data();
+#if defined(__aarch64__)
+    const char *option = getenv( "ORRERY_ARM64EC_PROCESS_EXIT_GUARD" );
+    /* Provider state and TLS binding are gone, and no notification was
+     * abandoned. Only this non-returning, signal-blocked endpoint certifies
+     * natural exit; a self-termination request alone is insufficient. */
+    if (is_arm64ec() && data->exit_guard_active && data->exit_cleanup_ready &&
+        !data->deferred_vm_depth && option && !strcmp( option, "1" ))
+    {
+        SERVER_START_REQ( process_exit_batch )
+        {
+            req->operation = 3;
+            req->exit_code = status;
+            wine_server_call( req );
+        }
+        SERVER_END_REQ;
+    }
+#endif
     cancel_deferred_vm_notifications( data );
     if (!do_msync()) close( data->alert_fd );
     close( data->wait_fd[0] );

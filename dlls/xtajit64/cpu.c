@@ -3759,6 +3759,17 @@ NTSTATUS WINAPI ThreadInit(void)
 /**********************************************************************
  *           ThreadTerm  (xtajit64.@)
  */
+BOOL WINAPI ThreadExitReady(void)
+{
+#ifdef HAVE_UNICORN
+    CHPE_V2_CPU_AREA_INFO *cpu = NtCurrentTeb()->ChpeV2CpuAreaInfo;
+    if (!cpu || cpu->EmulatorData[0] || cpu->SuspendDoorbell || !__wine_unixlib_handle) return FALSE;
+    return !XTAJIT64_CALL( thread_exit_ready, NULL );
+#else
+    return FALSE;
+#endif
+}
+
 void WINAPI ThreadTerm( HANDLE handle, LONG exit_code )
 {
 #ifdef HAVE_UNICORN

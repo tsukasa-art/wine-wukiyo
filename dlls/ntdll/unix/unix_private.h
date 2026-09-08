@@ -148,6 +148,7 @@ struct thread_data
     ULONG        deferred_vm_depth;
     sigset_t     exit_guard_mask;
     BOOL         exit_guard_active;
+    BOOL         exit_cleanup_ready; /* provider completion, cleared on returning failure */
     char         signal_stack[];    /* signal stack */
     /* char kernel_stack[] */
 };

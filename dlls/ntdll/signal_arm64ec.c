@@ -57,6 +57,7 @@ static NTSTATUS (WINAPI *pResyncIdentityMemoryMappingsStatus)(void);
 static void     (WINAPI *pResetToConsistentState)(EXCEPTION_RECORD*,CONTEXT*,ARM64_NT_CONTEXT*);
 static NTSTATUS (WINAPI *pThreadInit)(void);
 static void     (WINAPI *pThreadTerm)(HANDLE,LONG);
+static BOOL     (WINAPI *pThreadExitReady)(void);
 static void     (WINAPI *pUpdateProcessorInformation)(SYSTEM_CPU_INFORMATION*);
 
 static BOOLEAN emulated_processor_features[PROCESSOR_FEATURE_MAX];
@@ -433,6 +434,7 @@ NTSTATUS arm64ec_process_init( HMODULE module )
     GET_PTR( ResetToConsistentState );
     GET_PTR( ThreadInit );
     GET_PTR( ThreadTerm );
+    GET_PTR( ThreadExitReady ); /* optional provider completion certificate */
     GET_PTR( UpdateProcessorInformation );
 #undef GET_PTR
 
@@ -1236,6 +1238,11 @@ NTSTATUS SYSCALL_API NtTerminateThread( HANDLE handle, LONG exit_code )
             !get_arm64ec_cpu_area()->EmulatorData[0])
             acknowledge_single_deferred_provider_mutation( token_sequence,
                                                             token_generation );
+        if (self && pThreadExitReady && pThreadExitReady())
+        {
+            guard = 2;
+            WINE_UNIX_CALL( unix_thread_exit_guard, &guard );
+        }
         status = syscall_NtTerminateThread( handle, exit_code );
         if (self)
         {

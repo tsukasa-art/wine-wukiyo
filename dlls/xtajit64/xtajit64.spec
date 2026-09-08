@@ -17,6 +17,7 @@
 @ stdcall ResetToConsistentState(ptr ptr ptr)
 @ stdcall ThreadInit()
 @ stdcall ThreadTerm(ptr long)
+@ stdcall ThreadExitReady()
 @ stdcall UpdateProcessorInformation(ptr)
 @ stdcall ResyncIdentityMemoryMappings()
 @ stdcall ResyncIdentityMemoryMappingsStatus()

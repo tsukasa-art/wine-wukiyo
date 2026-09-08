@@ -416,6 +416,8 @@ static inline void init_thread_structure( struct thread *thread )
     thread->unix_tid        = -1;  /* not known yet */
     thread->context         = NULL;
     thread->process_termination = NULL;
+    thread->exit_cleanup_in_progress = 0;
+    thread->exit_cleanup_complete = 0;
     thread->termination_context = 0;
     thread->termination_target = NULL;
     thread->termination_owner = NULL;
@@ -463,7 +465,10 @@ static inline void init_thread_structure( struct thread *thread )
 static inline int is_thread_suspended( struct thread *thread )
 {
     if (thread->context && thread->context->cooperative) return 0;
-    if (thread->suspend || thread->termination_owner) return 1;
+    if (thread->suspend) return 1;
+    if (thread->termination_owner &&
+        !(thread->exit_cleanup_in_progress &&
+          thread->process->exit_preparation_owner == thread->termination_owner)) return 1;
     return !thread->bypass_proc_suspend && thread->process->suspend;
 }
 
@@ -1886,10 +1891,11 @@ static int termination_would_cycle( struct thread *owner, struct thread *target 
 DECL_HANDLER(prepare_thread_termination)
 {
     struct thread *thread;
-    if (current->termination_target || current->process->exit_preparation_owner)
+    if (current->termination_target)
     { set_error( STATUS_DEVICE_BUSY ); return; }
     if (!(thread = get_thread_from_handle( req->handle, THREAD_TERMINATE ))) return;
     if (thread == current) reply->self = 1;
+    else if (current->process->exit_preparation_owner) set_error( STATUS_DEVICE_BUSY );
     else if (thread->state == TERMINATED) set_error( STATUS_THREAD_IS_TERMINATING );
     else if (native_machine != IMAGE_FILE_MACHINE_ARM64 ||
              thread->process != current->process ||
@@ -1937,7 +1943,8 @@ DECL_HANDLER(finish_thread_termination)
 }
 
 /* operation 0 prepares all peers, 1 commits only once all are quiescent,
- * 2 cancels. The caller is the current process, so no external process handle
+ * 2 cancels, 3 certifies the current thread's non-returning clean exit,
+ * 4 begins protected self cleanup, and 5 cancels a returning self-exit failure. The caller is the current process, so no external process handle
  * or rights expansion is involved. All references survive target exit. */
 DECL_HANDLER(process_exit_batch)
 {
@@ -1953,7 +1960,28 @@ DECL_HANDLER(process_exit_batch)
         cancel_process_termination( current );
         return;
     }
-    if (req->operation > 2) { set_error( STATUS_INVALID_PARAMETER ); return; }
+    if (req->operation >= 3 && req->operation <= 5)
+    {
+        if (native_machine != IMAGE_FILE_MACHINE_ARM64 || process->machine != IMAGE_FILE_MACHINE_AMD64 || job)
+        { set_error( STATUS_INVALID_DEVICE_STATE ); return; }
+        if (req->operation == 3)
+        {
+            if (!current->exit_cleanup_in_progress) { set_error( STATUS_INVALID_DEVICE_STATE ); return; }
+            current->exit_cleanup_complete = 1;
+        }
+        else if (req->operation == 4)
+        {
+            current->exit_cleanup_in_progress = 1;
+            if (!is_thread_suspended( current )) wake_thread( current );
+        }
+        else
+        {
+            current->exit_cleanup_in_progress = 0;
+            current->exit_cleanup_complete = 0;
+        }
+        return;
+    }
+    if (req->operation > 5) { set_error( STATUS_INVALID_PARAMETER ); return; }
     if (!req->operation)
     {
         if (native_machine != IMAGE_FILE_MACHINE_ARM64 || process->machine != IMAGE_FILE_MACHINE_AMD64)
@@ -1974,6 +2002,7 @@ DECL_HANDLER(process_exit_batch)
             entry = &job->entries[job->count++];
             entry->thread = (struct thread *)grab_object( thread );
             thread->termination_owner = current;
+            if (thread->exit_cleanup_in_progress) continue;
             stop_thread( thread );
             if (!thread->context)
             {
@@ -1992,8 +2021,14 @@ DECL_HANDLER(process_exit_batch)
         /* Death via another route does not prove that the provider returned
          * its ownership before SIGQUIT. Never authorize DLL detach from it. */
         if (thread->state == TERMINATED)
-        { set_error( STATUS_THREAD_IS_TERMINATING ); return; }
-        if (thread->context != job->entries[i].context)
+        {
+            if (thread->exit_cleanup_complete) continue;
+            set_error( STATUS_THREAD_IS_TERMINATING ); return;
+        }
+        /* A context captured inside native ThreadTerm is not proof that its
+         * provider mutation has finished. Let the owner reach terminal exit. */
+        if (thread->exit_cleanup_in_progress) { set_error( STATUS_PENDING ); return; }
+        if (!job->entries[i].context || thread->context != job->entries[i].context)
         { set_error( STATUS_INVALID_DEVICE_STATE ); return; }
         if (thread->context->status && thread->context->status != STATUS_PENDING)
         { set_error( thread->context->status ); return; }

@@ -5873,6 +5873,16 @@ static NTSTATUS thread_term( void *args )
     return STATUS_SUCCESS;
 }
 
+/* A terminal self-exit certificate must not rely only on PE state teardown.
+ * The provider TLS binding must also have been returned successfully. */
+static NTSTATUS thread_exit_ready( void *args )
+{
+    (void)args;
+    pthread_once( &engine_key_once, make_engine_key );
+    if (engine_key_error) return STATUS_UNSUCCESSFUL;
+    return pthread_getspecific( engine_key ) ? STATUS_DEVICE_BUSY : STATUS_SUCCESS;
+}
+
 static void clear_flight_binding( struct thread_binding *binding )
 {
     binding->flight_recorder = NULL;
@@ -7690,6 +7700,7 @@ static NTSTATUS unicorn_not_supported( void *args )
 #define process_term             unicorn_not_supported
 #define thread_init              unicorn_not_supported
 #define thread_term              unicorn_not_supported
+#define thread_exit_ready        unicorn_not_supported
 #define memory_map               unicorn_not_supported
 #define memory_unmap             unicorn_not_supported
 #define memory_protect           unicorn_not_supported
@@ -7725,6 +7736,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     resolve_memory_fault,
     memory_snapshot_lock,
     memory_snapshot_unlock,
+    thread_exit_ready,
 };
 
 C_ASSERT( ARRAY_SIZE(__wine_unix_call_funcs) == unix_funcs_count );

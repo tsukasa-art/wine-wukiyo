@@ -89,6 +89,8 @@ struct thread
     int                    disable_boost; /* disable thread priority boost */
     int                    suspend;       /* suspend count */
     struct process_termination *process_termination; /* owned batch preparation */
+    int exit_cleanup_in_progress; /* protected provider ThreadTerm phase */
+    int exit_cleanup_complete; /* terminal self-exit provider certificate */
     obj_handle_t           termination_context; /* server-owned wait handle */
     struct thread         *termination_target; /* owned preparation, referenced */
     struct thread         *termination_owner;  /* private stop, not suspend count */

@@ -279,3 +279,23 @@ rollback, thread-creation gating, requester death, and a captured peer exiting
 before acknowledgement. Controlled delay helpers are test fixtures, not runtime
 instrumentation. These results do not establish safety for arbitrary external
 forced termination, every context race, real games, or product adoption.
+
+
+### Experimental natural-exit completion within a process-exit batch
+
+With the self-exit and process-exit guards enabled, the server now distinguishes
+protected provider cleanup from an ordinary context stop. A peer inside its
+own ThreadTerm cleanup is allowed to finish rather than being forcibly killed
+while it may own a provider mutation. A returning self-exit failure clears this
+phase. The optional `ThreadExitReady` provider export verifies that PE transition
+state, the suspend doorbell, and the Unix TLS binding are all released. Only a
+non-returning native exit with no outstanding VM notification certifies cleanup;
+the batch still waits for that thread to terminate before accepting it.
+
+An unconfirmed dead peer remains a failure. Merely issuing a self-termination
+request is insufficient. The same-process foreign-thread gate permits the
+requester's self-exit to proceed during a process batch, while peer kill requests
+remain excluded. Public suspend counts are not consumed. These changes retain
+the existing opt-in defaults and require matching ntdll, provider, and server
+artifacts; providers without the optional completion export remain conservative.
+No claim is made for arbitrary external forced termination or product adoption.

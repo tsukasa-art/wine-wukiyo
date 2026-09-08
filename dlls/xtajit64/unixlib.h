@@ -96,6 +96,7 @@ enum xtajit64_unix_funcs
     unix_resolve_memory_fault,
     unix_memory_snapshot_lock,
     unix_memory_snapshot_unlock,
+    unix_thread_exit_ready,
     unix_funcs_count
 };
 
