@@ -137,6 +137,11 @@ static HRESULT DSOUND_WaveFormat(DirectSoundDevice *device, IAudioClient *client
         wfe.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
         wfe.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
         wfe.Samples.wValidBitsPerSample = wfe.Format.wBitsPerSample = 32;
+        /* Honor the requested rate without importing the application's PCM
+         * layout into the shared float mixer. WRITEPRIMARY uses forcewave. */
+        if (device->primary_pwfx &&
+            device->primary_pwfx->nSamplesPerSec > wfe.Format.nSamplesPerSec)
+            wfe.Format.nSamplesPerSec = device->primary_pwfx->nSamplesPerSec;
 
         if (wfe.Format.nChannels < device->num_speakers) {
             device->speaker_config = DSOUND_FindSpeakerConfig(device->mmdevice, wfe.Format.nChannels);
@@ -494,7 +499,7 @@ HRESULT primarybuffer_SetFormat(DirectSoundDevice *device, LPCWAVEFORMATEX passe
 			 * pointless up-then-down resampling; keep prior behavior on failure. */
 			if (device->pwfx &&
 			    wfx->nSamplesPerSec > device->pwfx->nSamplesPerSec) {
-				HRESULT rehr = DSOUND_ReopenDevice(device, TRUE);
+				HRESULT rehr = DSOUND_ReopenDevice(device, FALSE);
 				if (FAILED(rehr)) {
 					WARN("swingby: honor-higher-rate reopen failed: %08lx, keeping device rate\n", rehr);
 					device->primary_pwfx = old_fmt;

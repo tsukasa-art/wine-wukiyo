@@ -403,3 +403,17 @@ yet established. WineD3D Vulkan still selects FL9.3; DXVK's reported FL11.0 is
 not proof of every FL11 feature. Visible game acceptance, broader allocation
 semantics, external sharing, i386, performance, and product deployment are not
 established by these tests.
+
+## E94 shared DirectSound format correction (isolated candidate)
+
+The inherited higher-rate primary-format handling reopened a non-WRITEPRIMARY
+stream with the application's PCM layout, although the shared mixer and its
+clamp require float samples. Preserve the device's shared float layout and
+channel mapping while raising only the sample rate; keep WRITEPRIMARY's
+forcewave path unchanged. This is an isolated candidate, not deployment of
+the title-specific audio overlay to the product. The x64 silent playback,
+stop and release control passes with matching build/prefix artifacts; it
+also passed before the fix and is not a reproducer of the game crash.
+E94 user observation confirms main-scene access without noise in that scene.
+A separate user-menu exit returned 0 without timeout or agent termination.
+Other scenes, movies and saves remain unverified.
