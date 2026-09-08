@@ -115,6 +115,9 @@ static struct instance *instance_from_handle( VkInstance handle )
     return CONTAINING_RECORD( object, struct instance, obj );
 }
 
+/* Isolated ARM64 translation experiment. Imported memory remains owned by NT. */
+static BOOL orrery_vulkan_host_memory;
+
 struct device_memory
 {
     struct vulkan_device_memory obj;
@@ -200,10 +203,17 @@ static VkResult allocate_external_host_memory( struct vulkan_device *device, VkM
         .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT,
     };
     uint32_t i, align = physical_device->external_memory_align - 1;
-    SIZE_T alloc_size = alloc_info->allocationSize;
+    SIZE_T alloc_size;
     static int once;
     void *mapping = NULL;
     VkResult res;
+
+    /* NT allocations are 64KB aligned. Reject unsupported alignment and overflow
+     * rather than importing less memory than the Vulkan allocation describes. */
+    if (align >= 0x10000 || ((align + 1) & align)
+            || alloc_info->allocationSize > ~(SIZE_T)0 - align)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    alloc_size = (alloc_info->allocationSize + align) & ~(SIZE_T)align;
 
     if (!once++) FIXME( "Using VK_EXT_external_memory_host\n" );
 
@@ -217,6 +227,8 @@ static VkResult allocate_external_host_memory( struct vulkan_device *device, VkM
                                                               mapping, &props )))
     {
         ERR( "vkGetMemoryHostPointerPropertiesEXT failed: %d\n", res );
+        alloc_size = 0;
+        NtFreeVirtualMemory( GetCurrentProcess(), &mapping, &alloc_size, MEM_RELEASE );
         return res;
     }
 
@@ -238,6 +250,7 @@ static VkResult allocate_external_host_memory( struct vulkan_device *device, VkM
             FIXME( "Not found compatible memory type\n" );
             alloc_size = 0;
             NtFreeVirtualMemory( GetCurrentProcess(), &mapping, &alloc_size, MEM_RELEASE );
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
         }
     }
 
@@ -248,7 +261,7 @@ static VkResult allocate_external_host_memory( struct vulkan_device *device, VkM
         import_info->pHostPointer = mapping;
         import_info->pNext = alloc_info->pNext;
         alloc_info->pNext = import_info;
-        alloc_info->allocationSize = (alloc_info->allocationSize + align) & ~align;
+        alloc_info->allocationSize = (alloc_info->allocationSize + align) & ~(VkDeviceSize)align;
     }
 
     return VK_SUCCESS;
@@ -520,14 +533,14 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
         }
     }
 
-    if (zero_bits && physical_device->extensions.has_VK_EXT_external_memory_host && !physical_device->map_placed_align)
+    if ((zero_bits || orrery_vulkan_host_memory) && physical_device->extensions.has_VK_EXT_external_memory_host && !physical_device->map_placed_align)
     {
         VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_mem_props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2 props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &host_mem_props};
 
         instance->p_vkGetPhysicalDeviceProperties2KHR( host_physical_device, &props );
         physical_device->external_memory_align = host_mem_props.minImportedHostPointerAlignment;
-        if (physical_device->external_memory_align) WARN( "Not using VK_EXT_external_memory_host for memory mapping\n" );
+        if (!physical_device->external_memory_align) WARN( "Not using VK_EXT_external_memory_host for memory mapping\n" );
         else TRACE( "Using VK_EXT_external_memory_host for memory mapping with alignment: %u\n", physical_device->external_memory_align );
     }
 
@@ -916,13 +929,30 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA
         }
     }
 
+    /* In this opt-in experiment shared/exported and non-coherent allocations
+     * remain outside the supported contract; do not silently expose host pointers. */
+    if (orrery_vulkan_host_memory && (export_info || import_win32 || pointer_info))
+        return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
     /* For host visible memory, we try to use VK_EXT_external_memory_host on wow64 to ensure that mapped pointer is 32-bit. */
     mem_flags = physical_device->memory_properties.memoryTypes[alloc_info->memoryTypeIndex].propertyFlags;
+    if (orrery_vulkan_host_memory && (mem_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+            && (!(mem_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) || !physical_device->external_memory_align))
+        return VK_ERROR_FEATURE_NOT_PRESENT;
     if (physical_device->external_memory_align && (mem_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !pointer_info &&
         (res = allocate_external_host_memory( device, alloc_info, mem_flags, &host_pointer_info )))
         return res;
 
-    if (!(memory = calloc( 1, sizeof(*memory) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (alloc_info->pNext == &host_pointer_info) mapping = host_pointer_info.pHostPointer;
+    if (!(memory = calloc( 1, sizeof(*memory) )))
+    {
+        if (mapping)
+        {
+            SIZE_T size = 0;
+            NtFreeVirtualMemory( GetCurrentProcess(), &mapping, &size, MEM_RELEASE );
+        }
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
 
     if (import_win32)
     {
@@ -1018,6 +1048,14 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA
 
 failed:
     WARN( "Failed to allocate memory, res %d\n", res );
+    if (mapping)
+    {
+        SIZE_T size = 0;
+        /* Release Vulkan ownership before the backing NT allocation. */
+        if (host_device_memory) device->p_vkFreeMemory( device->host.device, host_device_memory, NULL );
+        host_device_memory = VK_NULL_HANDLE;
+        NtFreeVirtualMemory( GetCurrentProcess(), &mapping, &size, MEM_RELEASE );
+    }
     if (host_device_memory) device->p_vkFreeMemory( device->host.device, host_device_memory, NULL );
     if (memory->semaphore) device->p_vkDestroySemaphore( device->host.device, memory->semaphore, NULL );
     d3dkmt_destroy_resource( memory->local );
@@ -3080,6 +3118,12 @@ static void vulkan_init_once(void)
     LOAD_FUNCPTR( vkGetInstanceProcAddr );
 #undef LOAD_FUNCPTR
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    {
+        const char *value = getenv( "ORRERY_ARM64EC_VULKAN_HOST_MEMORY" );
+        orrery_vulkan_host_memory = value && !strcmp( value, "1" );
+    }
+#endif
     driver_funcs = &lazydrv_funcs;
     vulkan_funcs.p_vkGetInstanceProcAddr = p_vkGetInstanceProcAddr;
     vulkan_funcs.p_vkGetDeviceProcAddr = p_vkGetDeviceProcAddr;

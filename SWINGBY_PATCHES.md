@@ -368,3 +368,38 @@ polygon-offset-clamp requirements remain unmet. CGL pbuffer creation also fails
 in a native ARM64 control and with this mode off, before profile sharing.
 Neither pbuffer support, 32-bit rendering, games nor product deployment is
 claimed. All changes remain in the isolated candidate.
+
+### E91: opt-in NT-owned Vulkan host memory
+
+`ORRERY_ARM64EC_VULKAN_HOST_MEMORY=1` enables the existing external-host-memory
+allocation path for the isolated Apple ARM64 host, without changing CPU VM
+permissions or advertising additional graphics capabilities. Host-visible memory
+must be coherent and the device must support `VK_EXT_external_memory_host`.
+Explicit external import/export requests are rejected in this limited mode.
+The default is off. This is not general Vulkan or 32-bit compatibility.
+
+The shared allocation helper now rounds the NT allocation before import, checks
+alignment/size overflow, frees on property-query and incompatible-type failure,
+and preserves 64-bit sizes. Automatically imported mappings are retained by the
+memory object, returned with the requested map offset, and released after Vulkan
+ownership ends. Failure after allocation also releases that NT backing. These
+helper/lifetime corrections also affect the pre-existing WOW64 path; i386 runtime
+validation remains outstanding, rather than being inferred from x64 tests.
+
+The compile experiment enables configure.ac's existing `SONAME_LIBVULKAN` path
+with the locally installed ARM64 MoltenVK. It only rebuilds `win32u/vulkan.o` and
+`win32u.so`; it is not a completed production build-configuration change. The
+retained script and manifests record this override and external-library identity.
+
+Evidence: E91 in the private runtime plan. The unchanged x64 Vulkan fixture
+faulted when directly reading host-allocated mapped memory, then passed with the
+opt-in NT-owned allocation. Three sizes over nine cycles verify CPU upload, GPU
+copy/fill, direct readback, offset remapping, and MEM_FREE after release. Eight
+mocked cases test the exact allocation helper's error/alignment/overflow paths.
+D3D9 and OpenGL RGBA8 regressions pass. An isolated copy of the existing macOS
+DXVK binary creates SM4/SM5 shaders and renders 4,104 matching pixels over nine
+D3D11 draws, with device refs zero at release. Its exact source rebuild is not
+yet established. WineD3D Vulkan still selects FL9.3; DXVK's reported FL11.0 is
+not proof of every FL11 feature. Visible game acceptance, broader allocation
+semantics, external sharing, i386, performance, and product deployment are not
+established by these tests.
