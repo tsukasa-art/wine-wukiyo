@@ -1,6 +1,6 @@
 # Melammu Wine Patch Policy + Ledger (swingby-wine)
 
-Last updated: 2026-09-07
+Last updated: 2026-09-08
 
 This repository is the public Wine fork used by the private Melammu launcher.
 The existing stable lineage starts at **WineHQ Wine 10.0** (`b0738596`,
@@ -222,3 +222,19 @@ The old `build.sh` remains the x86 build route. ARM64 validation uses a separate
 build directory, a matching multi-architecture llvm-mingw toolchain, and the
 selected Unicorn library. Limited CPU and drawing checks do not establish
 full media, mixed GL/Metal, title-specific capture, or product-runtime parity.
+
+### Experimental thread-exit ownership
+
+Deferred ARM64EC VM notifications now record ownership in native thread data.
+Native abort cleanup retires only the departing thread's outstanding count and
+marks the mapping state dirty; subsequent x64 execution still requires the
+provider's authoritative resynchronization.
+
+`ORRERY_ARM64EC_EXIT_GUARD=1` additionally defers SIGQUIT for a thread terminating
+itself, from its provider ThreadTerm callback through native/TLS cleanup.
+A returning failure restores the saved signal mask. The option is disabled by
+default and does not mask ordinary synchronous I/O or arbitrary guest execution.
+It addresses interrupted inactive-binding cleanup, not arbitrary cancellation
+of an active provider engine, abandoned foreign mutation ownership, or complete
+process-exit compatibility. No provider lock reset or early provider shutdown
+is introduced. These are experimental migration changes, not a deployed runtime.

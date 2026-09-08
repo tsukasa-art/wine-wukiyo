@@ -1100,9 +1100,126 @@ static void contexts_from_server( CONTEXT *context, struct context_data server_c
 /***********************************************************************
  *           pthread_exit_wrapper
  */
+/* Experimental self-termination boundary. SIGQUIT must not discard a
+ * provider mutex/token while ThreadTerm returns the current thread's state.
+ * This does not protect arbitrary worker execution or block synchronous I/O.
+ * Successful self-termination never returns: native exit and TLS destructors
+ * retain the mask. A failed termination restores exactly the previous mask. */
+NTSTATUS unixcall_thread_exit_guard( void *args )
+{
+    static LONG enabled = -1;
+    struct thread_data *data = get_thread_data();
+    LONG current = InterlockedCompareExchange( &enabled, -1, -1 );
+    const char *value;
+    sigset_t mask;
+    ULONG enable;
+
+    if (!args || !data) return STATUS_INVALID_PARAMETER;
+    enable = *(const ULONG *)args;
+    if (enable > 1) return STATUS_INVALID_PARAMETER;
+    if (current == -1)
+    {
+        value = getenv( "ORRERY_ARM64EC_EXIT_GUARD" );
+        current = value && !strcmp( value, "1" );
+        InterlockedCompareExchange( &enabled, current, -1 );
+    }
+    if (!current) return STATUS_SUCCESS;
+    if (enable)
+    {
+        if (data->exit_guard_active) return STATUS_INVALID_DEVICE_STATE;
+        sigemptyset( &mask );
+        sigaddset( &mask, SIGQUIT );
+        if (pthread_sigmask( SIG_BLOCK, &mask, &data->exit_guard_mask ))
+            return STATUS_UNSUCCESSFUL;
+        data->exit_guard_active = TRUE;
+    }
+    else
+    {
+        if (!data->exit_guard_active) return STATUS_INVALID_DEVICE_STATE;
+        if (pthread_sigmask( SIG_SETMASK, &data->exit_guard_mask, NULL ))
+            return STATUS_UNSUCCESSFUL;
+        data->exit_guard_active = FALSE;
+    }
+    return STATUS_SUCCESS;
+}
+
+/* The caller blocks server signals while changing ownership. A terminating
+ * thread never guesses how much another thread owns, and never enters PE or
+ * provider callbacks from its abort path. Abandoned operations are dirty:
+ * their Windows-visible result is unknown, so the surviving execution gate
+ * must obtain an authoritative mapping snapshot before resuming x64 code. */
+static void cancel_deferred_vm_notifications( struct thread_data *data )
+{
+    ULONG depth = data->deferred_vm_depth;
+    if (!depth) return;
+    InterlockedExchangeAdd64( (LONGLONG *)(ULONG_PTR)data->deferred_vm.generation, depth );
+    InterlockedExchangeAdd64( (LONGLONG *)(ULONG_PTR)data->deferred_vm.sequence, depth );
+    data->deferred_vm_depth = 0;
+    InterlockedExchangeAdd( (LONG *)(ULONG_PTR)data->deferred_vm.active, -(LONG)depth );
+}
+
+NTSTATUS unixcall_deferred_vm_notification( void *args )
+{
+    const struct deferred_vm_notification_params *params = args;
+    struct thread_data *data = get_thread_data();
+    sigset_t previous;
+    NTSTATUS status = STATUS_SUCCESS;
+    LONG *active;
+    LONGLONG *sequence, *generation;
+
+    if (!params) return STATUS_INVALID_PARAMETER;
+    if (!data) return STATUS_INVALID_DEVICE_STATE;
+    active = (LONG *)(ULONG_PTR)params->active;
+    sequence = (LONGLONG *)(ULONG_PTR)params->sequence;
+    generation = (LONGLONG *)(ULONG_PTR)params->generation;
+
+    if (!active || !sequence || !generation ||
+        ((ULONG_PTR)active & 3) || ((ULONG_PTR)sequence & 7) || ((ULONG_PTR)generation & 7))
+        return STATUS_INVALID_PARAMETER;
+    if (pthread_sigmask( SIG_BLOCK, &server_block_set, &previous ))
+        return STATUS_UNSUCCESSFUL;
+    if (data->deferred_vm_depth &&
+        (params->active != data->deferred_vm.active ||
+         params->sequence != data->deferred_vm.sequence ||
+         params->generation != data->deferred_vm.generation))
+        status = STATUS_INVALID_PARAMETER;
+    else switch (params->operation)
+    {
+    case DEFERRED_VM_BEGIN:
+        if (data->deferred_vm_depth == 0x7fffffff) { status = STATUS_INTEGER_OVERFLOW; break; }
+        data->deferred_vm = *params;
+        data->deferred_vm_depth++;
+        InterlockedIncrement( active );
+        InterlockedIncrement64( sequence );
+        break;
+    case DEFERRED_VM_END:
+        if (!data->deferred_vm_depth) { status = STATUS_INVALID_DEVICE_STATE; break; }
+        if (NT_SUCCESS(params->status)) InterlockedIncrement64( generation );
+        InterlockedIncrement64( sequence );
+        data->deferred_vm_depth--;
+        InterlockedDecrement( active );
+        break;
+    case DEFERRED_VM_MARK:
+        InterlockedIncrement( active );
+        InterlockedIncrement64( sequence );
+        InterlockedIncrement64( generation );
+        InterlockedIncrement64( sequence );
+        InterlockedDecrement( active );
+        break;
+    default:
+        status = STATUS_INVALID_PARAMETER;
+        break;
+    }
+    /* Only these short bookkeeping stores are protected. In particular a
+     * nested synchronous NtReadFile remains interruptible while it blocks. */
+    if (pthread_sigmask( SIG_SETMASK, &previous, NULL )) return STATUS_UNSUCCESSFUL;
+    return status;
+}
+
 static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
 {
     struct thread_data *data = get_thread_data();
+    cancel_deferred_vm_notifications( data );
     if (!do_msync()) close( data->alert_fd );
     close( data->wait_fd[0] );
     close( data->wait_fd[1] );

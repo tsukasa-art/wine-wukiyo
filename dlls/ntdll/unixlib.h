@@ -159,11 +159,23 @@ enum ntdll_unix_funcs
     unix_resolve_native_guard,
     unix_get_exception_stack,
     unix_prepare_shared_stack,
+    unix_deferred_vm_notification,
+    unix_thread_exit_guard,
 };
 
 extern unixlib_handle_t __wine_unixlib_handle;
 
 struct exception_stack_params { UINT64 limit, base; };
 struct shared_stack_init_params { UINT64 sp; };
+
+/* Private ARM64EC notification bookkeeping. Pointers refer to process-lifetime
+ * ntdll globals; the Unix thread records ownership before cancellation resumes. */
+enum deferred_vm_operation { DEFERRED_VM_BEGIN, DEFERRED_VM_END, DEFERRED_VM_MARK };
+struct deferred_vm_notification_params
+{
+    UINT64 active, sequence, generation;
+    ULONG operation;
+    NTSTATUS status;
+};
 
 #endif /* __NTDLL_UNIXLIB_H */

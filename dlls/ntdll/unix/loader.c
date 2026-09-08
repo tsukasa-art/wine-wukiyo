@@ -2087,11 +2087,14 @@ static const unixlib_entry_t unix_call_funcs[] =
     virtual_resolve_native_guard,
     virtual_get_exception_stack,
     virtual_prepare_shared_stack,
+    unixcall_deferred_vm_notification,
+    unixcall_thread_exit_guard,
 };
 
 
 #ifdef _WIN64
 
+static NTSTATUS wow64_deferred_vm_notification( void *args ) { return STATUS_NOT_SUPPORTED; }
 static NTSTATUS wow64_load_so_dll( void *args ) { return STATUS_INVALID_IMAGE_FORMAT; }
 static NTSTATUS wow64_unwind_builtin_dll( void *args ) { return STATUS_UNSUCCESSFUL; }
 
@@ -2117,6 +2120,8 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
     virtual_resolve_native_guard,
     virtual_get_exception_stack,
     virtual_prepare_shared_stack,
+    wow64_deferred_vm_notification,
+    unixcall_thread_exit_guard,
 };
 
 static const struct wine_unixlib_dispatch_source_v1 ntdll_wow64_dispatch_source =

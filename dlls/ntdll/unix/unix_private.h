@@ -144,6 +144,10 @@ struct thread_data
     void *native_guard_stack; /* normal-context dispatcher stack with a 16K bottom guard */
     ULONG_PTR native_guard_limit, native_guard_base; /* signal snapshot of stack ownership */
     struct native_guard_params native_guard; /* signal-owned pending operand */
+    struct deferred_vm_notification_params deferred_vm;
+    ULONG        deferred_vm_depth;
+    sigset_t     exit_guard_mask;
+    BOOL         exit_guard_active;
     char         signal_stack[];    /* signal stack */
     /* char kernel_stack[] */
 };
@@ -297,6 +301,8 @@ extern NTSTATUS load_package_graph_snapshot( int fd, data_size_t size,
                                              BOOL low_address, void **result );
 extern NTSTATUS unixcall_get_process_package_graph( void *args );
 extern void process_exit_wrapper( int status ) DECLSPEC_NORETURN;
+extern NTSTATUS unixcall_deferred_vm_notification( void *args );
+extern NTSTATUS unixcall_thread_exit_guard( void *args );
 extern size_t server_init_process(void);
 extern void server_init_process_done(void);
 extern void server_init_thread( struct thread_data *data );

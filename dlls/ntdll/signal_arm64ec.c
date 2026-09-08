@@ -197,23 +197,39 @@ static BOOL acknowledge_single_deferred_provider_mutation( LONGLONG token_sequen
     return ret;
 }
 
+static void update_deferred_vm_notification( ULONG operation, NTSTATUS result )
+{
+    struct deferred_vm_notification_params params =
+    {
+        (ULONG_PTR)&deferred_vm_active, (ULONG_PTR)&deferred_vm_sequence,
+        (ULONG_PTR)&deferred_vm_generation, operation, result
+    };
+    NTSTATUS status = WINE_UNIX_CALL( unix_deferred_vm_notification, &params );
+    if (status) RtlRaiseStatus( status );
+}
+
 static inline void mark_deferred_provider_resync(void)
 {
-    /* Active brackets the publication so two concurrent completed mutations
-     * cannot expose an apparently stable even sequence between their writes. */
-    InterlockedIncrement( &deferred_vm_active );
-    InterlockedIncrement64( &deferred_vm_sequence );
-    InterlockedIncrement64( &deferred_vm_generation );
-    InterlockedIncrement64( &deferred_vm_sequence );
-    if (!InterlockedDecrement( &deferred_vm_active ))
-        RtlWakeAddressAll( &deferred_vm_active );
+    update_deferred_vm_notification( DEFERRED_VM_MARK, STATUS_SUCCESS );
+    if (!read_generation( &deferred_vm_active )) RtlWakeAddressAll( &deferred_vm_active );
+}
+
+static void wait_deferred_vm_quiescent(void)
+{
+    LARGE_INTEGER timeout;
+    LONG active;
+
+    /* Normal completion wakes immediately. Abort cleanup is native-only and
+     * cannot enter the PE address-wait table, so recheck ownership on timeout. */
+    timeout.QuadPart = -200000;
+    while ((active = read_generation( &deferred_vm_active )))
+        RtlWaitOnAddress( &deferred_vm_active, &active, sizeof(active), &timeout );
 }
 
 static NTSTATUS drain_deferred_provider_state(void)
 {
     LONGLONG generation;
     NTSTATUS status = STATUS_SUCCESS;
-    LONG active;
     ULONG attempt;
 
     RtlAcquireSRWLockExclusive( &deferred_vm_resync_lock );
@@ -221,8 +237,7 @@ static NTSTATUS drain_deferred_provider_state(void)
     {
         if (deferred_provider_sync_done()) break;
 
-        while ((active = read_generation( &deferred_vm_active )))
-            RtlWaitOnAddress( &deferred_vm_active, &active, sizeof(active), NULL );
+        wait_deferred_vm_quiescent();
 
         generation = read_generation64( &deferred_vm_generation );
         if (generation != read_generation64( &deferred_vm_resynced_generation ))
@@ -243,8 +258,7 @@ static NTSTATUS drain_deferred_provider_state(void)
                  * Do not acknowledge or swallow a stable query failure. */
                 if (status != STATUS_NOT_MAPPED_VIEW && status != STATUS_INVALID_ADDRESS &&
                     status != STATUS_RETRY) break;
-                while ((active = read_generation( &deferred_vm_active )))
-                    RtlWaitOnAddress( &deferred_vm_active, &active, sizeof(active), NULL );
+                wait_deferred_vm_quiescent();
                 if (read_generation64( &deferred_vm_generation ) == generation) break;
                 WARN( "retry deferred mapping snapshot status %#lx generation %I64d -> %I64d\n",
                       status, generation, read_generation64( &deferred_vm_generation ) );
@@ -252,8 +266,7 @@ static NTSTATUS drain_deferred_provider_state(void)
                 continue;
             }
 
-            while ((active = read_generation( &deferred_vm_active )))
-                RtlWaitOnAddress( &deferred_vm_active, &active, sizeof(active), NULL );
+            wait_deferred_vm_quiescent();
             if (read_generation64( &deferred_vm_generation ) == generation)
                 InterlockedExchange64( &deferred_vm_resynced_generation, generation );
             continue;
@@ -284,20 +297,15 @@ NTSTATUS WINAPI __wine_arm64ec_prepare_x64_execution(void)
 
 static inline BOOL begin_deferred_vm_mutation(void)
 {
-    /* Only current-process mutations affect this provider's identity lane.
-     * Remote mutations retain the bounded cross-process work-list contract. */
-    InterlockedIncrement( &deferred_vm_active );
-    InterlockedIncrement64( &deferred_vm_sequence );
+    update_deferred_vm_notification( DEFERRED_VM_BEGIN, STATUS_SUCCESS );
     return TRUE;
 }
 
 static inline void end_deferred_vm_mutation( BOOL deferred, NTSTATUS status )
 {
     if (!deferred) return;
-    if (NT_SUCCESS(status)) InterlockedIncrement64( &deferred_vm_generation );
-    InterlockedIncrement64( &deferred_vm_sequence );
-    if (!InterlockedDecrement( &deferred_vm_active ))
-        RtlWakeAddressAll( &deferred_vm_active );
+    update_deferred_vm_notification( DEFERRED_VM_END, status );
+    if (!read_generation( &deferred_vm_active )) RtlWakeAddressAll( &deferred_vm_active );
 }
 
 /**********************************************************************
@@ -1204,11 +1212,22 @@ NTSTATUS SYSCALL_API NtTerminateThread( HANDLE handle, LONG exit_code )
 {
     LONGLONG token_sequence = 0, token_generation = 0;
     void *thread_state;
-    BOOL thread_token;
+    BOOL thread_token, self;
+    ULONG guard;
     NTSTATUS status;
 
     if (pThreadTerm && enter_syscall_callback())
     {
+        self = RtlIsCurrentThread( handle );
+        if (self)
+        {
+            guard = 1;
+            if ((status = WINE_UNIX_CALL( unix_thread_exit_guard, &guard )))
+            {
+                leave_syscall_callback();
+                return status;
+            }
+        }
         thread_state = get_arm64ec_cpu_area()->EmulatorData[0];
         thread_token = capture_deferred_provider_sync_token( &token_sequence,
                                                               &token_generation );
@@ -1218,6 +1237,13 @@ NTSTATUS SYSCALL_API NtTerminateThread( HANDLE handle, LONG exit_code )
             acknowledge_single_deferred_provider_mutation( token_sequence,
                                                             token_generation );
         status = syscall_NtTerminateThread( handle, exit_code );
+        if (self)
+        {
+            NTSTATUS restore;
+            guard = 0;
+            if ((restore = WINE_UNIX_CALL( unix_thread_exit_guard, &guard )))
+                RtlRaiseStatus( restore );
+        }
         leave_syscall_callback();
         return status;
     }
