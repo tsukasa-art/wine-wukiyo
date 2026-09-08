@@ -238,3 +238,19 @@ It addresses interrupted inactive-binding cleanup, not arbitrary cancellation
 of an active provider engine, abandoned foreign mutation ownership, or complete
 process-exit compatibility. No provider lock reset or early provider shutdown
 is introduced. These are experimental migration changes, not a deployed runtime.
+
+### Experimental ARM64EC foreign-thread termination preparation
+
+The migration branch adds an opt-in `ORRERY_ARM64EC_FOREIGN_EXIT_GUARD=1`
+path for same-process foreign-thread termination. The server checks the original
+`THREAD_TERMINATE` right and owns a private stop until context acknowledgement
+and commit/cancel. The client waits at most two seconds for acknowledgement;
+timeout cancels rather than reporting a successful kill. Requester cleanup drops
+the target reference and wait handle. Public suspend counts remain independent,
+and preparation cycles are rejected. Already-exited targets retain successful
+termination return semantics. The protocol extension requires matching server
+and client artifacts and is tested only in an isolated prefix.
+
+This is disabled by default. It does not establish general process termination,
+cross-process termination, all concurrent context operations, or product runtime
+adoption. It complements the separately gated self-exit protection.

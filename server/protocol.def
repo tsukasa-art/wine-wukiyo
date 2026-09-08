@@ -1218,6 +1218,20 @@ typedef volatile struct
 @END
 
 
+/* Prepare a same-process thread termination at a cooperative safe point. */
+@REQ(prepare_thread_termination)
+    obj_handle_t handle;
+@REPLY
+    obj_handle_t context;
+    int self;
+@END
+
+/* Commit the caller-owned preparation, or cancel its private stop. */
+@REQ(finish_thread_termination)
+    int commit;
+    int exit_code;
+@END
+
 /* Terminate a thread */
 @REQ(terminate_thread)
     obj_handle_t handle;       /* thread handle to terminate */

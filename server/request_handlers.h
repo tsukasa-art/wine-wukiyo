@@ -15,6 +15,8 @@ DECL_HANDLER(init_process_done);
 DECL_HANDLER(init_first_thread);
 DECL_HANDLER(init_thread);
 DECL_HANDLER(terminate_process);
+DECL_HANDLER(prepare_thread_termination);
+DECL_HANDLER(finish_thread_termination);
 DECL_HANDLER(terminate_thread);
 DECL_HANDLER(get_process_info);
 DECL_HANDLER(get_process_debug_info);
@@ -327,6 +329,8 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_init_first_thread,
     (req_handler)req_init_thread,
     (req_handler)req_terminate_process,
+    (req_handler)req_prepare_thread_termination,
+    (req_handler)req_finish_thread_termination,
     (req_handler)req_terminate_thread,
     (req_handler)req_get_process_info,
     (req_handler)req_get_process_debug_info,
@@ -749,6 +753,14 @@ C_ASSERT( offsetof(struct terminate_process_request, exit_code) == 16 );
 C_ASSERT( sizeof(struct terminate_process_request) == 24 );
 C_ASSERT( offsetof(struct terminate_process_reply, self) == 8 );
 C_ASSERT( sizeof(struct terminate_process_reply) == 16 );
+C_ASSERT( offsetof(struct prepare_thread_termination_request, handle) == 12 );
+C_ASSERT( sizeof(struct prepare_thread_termination_request) == 16 );
+C_ASSERT( offsetof(struct prepare_thread_termination_reply, context) == 8 );
+C_ASSERT( offsetof(struct prepare_thread_termination_reply, self) == 12 );
+C_ASSERT( sizeof(struct prepare_thread_termination_reply) == 16 );
+C_ASSERT( offsetof(struct finish_thread_termination_request, commit) == 12 );
+C_ASSERT( offsetof(struct finish_thread_termination_request, exit_code) == 16 );
+C_ASSERT( sizeof(struct finish_thread_termination_request) == 24 );
 C_ASSERT( offsetof(struct terminate_thread_request, handle) == 12 );
 C_ASSERT( offsetof(struct terminate_thread_request, exit_code) == 16 );
 C_ASSERT( sizeof(struct terminate_thread_request) == 24 );

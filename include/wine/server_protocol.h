@@ -1255,6 +1255,32 @@ struct terminate_process_reply
 
 
 
+struct prepare_thread_termination_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+};
+struct prepare_thread_termination_reply
+{
+    struct reply_header __header;
+    obj_handle_t context;
+    int self;
+};
+
+
+struct finish_thread_termination_request
+{
+    struct request_header __header;
+    int commit;
+    int exit_code;
+    char __pad_20[4];
+};
+struct finish_thread_termination_reply
+{
+    struct reply_header __header;
+};
+
+
 struct terminate_thread_request
 {
     struct request_header __header;
@@ -6248,6 +6274,8 @@ enum request
     REQ_init_first_thread,
     REQ_init_thread,
     REQ_terminate_process,
+    REQ_prepare_thread_termination,
+    REQ_finish_thread_termination,
     REQ_terminate_thread,
     REQ_get_process_info,
     REQ_get_process_debug_info,
@@ -6563,6 +6591,8 @@ union generic_request
     struct init_first_thread_request init_first_thread_request;
     struct init_thread_request init_thread_request;
     struct terminate_process_request terminate_process_request;
+    struct prepare_thread_termination_request prepare_thread_termination_request;
+    struct finish_thread_termination_request finish_thread_termination_request;
     struct terminate_thread_request terminate_thread_request;
     struct get_process_info_request get_process_info_request;
     struct get_process_debug_info_request get_process_debug_info_request;
@@ -6876,6 +6906,8 @@ union generic_reply
     struct init_first_thread_reply init_first_thread_reply;
     struct init_thread_reply init_thread_reply;
     struct terminate_process_reply terminate_process_reply;
+    struct prepare_thread_termination_reply prepare_thread_termination_reply;
+    struct finish_thread_termination_reply finish_thread_termination_reply;
     struct terminate_thread_reply terminate_thread_reply;
     struct get_process_info_reply get_process_info_reply;
     struct get_process_debug_info_reply get_process_debug_info_reply;
@@ -7178,6 +7210,6 @@ union generic_reply
     struct get_process_vm_machine_reply get_process_vm_machine_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 954
+#define SERVER_PROTOCOL_VERSION 955
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

@@ -1883,6 +1883,54 @@ NTSTATUS WINAPI NtAlertThread( HANDLE handle )
 }
 
 
+#if defined(__aarch64__)
+static BOOL use_foreign_exit_guard(void)
+{
+    static LONG enabled = -1;
+    LONG value = InterlockedCompareExchange( &enabled, -1, -1 );
+    if (value == -1)
+    {
+        const char *option = getenv( "ORRERY_ARM64EC_FOREIGN_EXIT_GUARD" );
+        value = option && !strcmp( option, "1" );
+        InterlockedCompareExchange( &enabled, value, -1 );
+    }
+    return is_arm64ec() && value;
+}
+
+static NTSTATUS prepare_foreign_termination( HANDLE handle, LONG exit_code, BOOL *self )
+{
+    NTSTATUS status, finish;
+    HANDLE context = 0;
+    LARGE_INTEGER timeout;
+    *self = FALSE;
+    SERVER_START_REQ( prepare_thread_termination )
+    {
+        req->handle = wine_server_obj_handle( handle );
+        status = wine_server_call( req );
+        context = wine_server_ptr_handle( reply->context );
+        *self = !status && reply->self;
+    }
+    SERVER_END_REQ;
+    /* A validated target which already exited satisfies termination. */
+    if (status == STATUS_THREAD_IS_TERMINATING) return STATUS_SUCCESS;
+    if (status || *self) return status;
+    timeout.QuadPart = -2 * (LONGLONG)10000000;
+    status = NtWaitForSingleObject( context, FALSE, &timeout );
+    /* The server closes the private wait handle on finish or caller death. */
+    SERVER_START_REQ( finish_thread_termination )
+    {
+        req->commit = !status;
+        req->exit_code = exit_code;
+        finish = wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    /* STATUS_TIMEOUT is a success-severity wait result, not successful kill. */
+    if (status == STATUS_TIMEOUT) return STATUS_IO_TIMEOUT;
+    if (!status && finish == STATUS_THREAD_IS_TERMINATING) return STATUS_SUCCESS;
+    return status ? status : finish;
+}
+#endif
+
 /******************************************************************************
  *              NtTerminateThread  (NTDLL.@)
  */
@@ -1890,6 +1938,14 @@ NTSTATUS WINAPI NtTerminateThread( HANDLE handle, LONG exit_code )
 {
     unsigned int ret;
     BOOL self;
+
+#if defined(__aarch64__)
+    if (use_foreign_exit_guard())
+    {
+        ret = prepare_foreign_termination( handle, exit_code, &self );
+        if (ret || !self) return ret;
+    }
+#endif
 
     SERVER_START_REQ( terminate_thread )
     {

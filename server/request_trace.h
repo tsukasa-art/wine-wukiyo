@@ -182,6 +182,23 @@ static void dump_terminate_process_reply( const struct terminate_process_reply *
     fprintf( stderr, " self=%d", req->self );
 }
 
+static void dump_prepare_thread_termination_request( const struct prepare_thread_termination_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+}
+
+static void dump_prepare_thread_termination_reply( const struct prepare_thread_termination_reply *req )
+{
+    fprintf( stderr, " context=%04x", req->context );
+    fprintf( stderr, ", self=%d", req->self );
+}
+
+static void dump_finish_thread_termination_request( const struct finish_thread_termination_request *req )
+{
+    fprintf( stderr, " commit=%d", req->commit );
+    fprintf( stderr, ", exit_code=%d", req->exit_code );
+}
+
 static void dump_terminate_thread_request( const struct terminate_thread_request *req )
 {
     fprintf( stderr, " handle=%04x", req->handle );
@@ -3551,6 +3568,8 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_init_first_thread_request,
     (dump_func)dump_init_thread_request,
     (dump_func)dump_terminate_process_request,
+    (dump_func)dump_prepare_thread_termination_request,
+    (dump_func)dump_finish_thread_termination_request,
     (dump_func)dump_terminate_thread_request,
     (dump_func)dump_get_process_info_request,
     (dump_func)dump_get_process_debug_info_request,
@@ -3863,6 +3882,8 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_init_first_thread_reply,
     (dump_func)dump_init_thread_reply,
     (dump_func)dump_terminate_process_reply,
+    (dump_func)dump_prepare_thread_termination_reply,
+    NULL,
     (dump_func)dump_terminate_thread_reply,
     (dump_func)dump_get_process_info_reply,
     (dump_func)dump_get_process_debug_info_reply,
@@ -4175,6 +4196,8 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "init_first_thread",
     "init_thread",
     "terminate_process",
+    "prepare_thread_termination",
+    "finish_thread_termination",
     "terminate_thread",
     "get_process_info",
     "get_process_debug_info",
@@ -4539,6 +4562,7 @@ static const struct
     { "INVALID_CID",                 STATUS_INVALID_CID },
     { "INVALID_CONNECTION",          STATUS_INVALID_CONNECTION },
     { "INVALID_DEVICE_REQUEST",      STATUS_INVALID_DEVICE_REQUEST },
+    { "INVALID_DEVICE_STATE",        STATUS_INVALID_DEVICE_STATE },
     { "INVALID_FILE_FOR_SECTION",    STATUS_INVALID_FILE_FOR_SECTION },
     { "INVALID_HANDLE",              STATUS_INVALID_HANDLE },
     { "INVALID_IMAGE_FORMAT",        STATUS_INVALID_IMAGE_FORMAT },

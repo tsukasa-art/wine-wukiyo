@@ -88,6 +88,9 @@ struct thread
     int                    base_priority; /* base priority level (relative to process base priority class) */
     int                    disable_boost; /* disable thread priority boost */
     int                    suspend;       /* suspend count */
+    obj_handle_t           termination_context; /* server-owned wait handle */
+    struct thread         *termination_target; /* owned preparation, referenced */
+    struct thread         *termination_owner;  /* private stop, not suspend count */
     bool                   is_system;     /* system thread (kernel mode only) */
     bool                   dbg_hidden;    /* hidden from debugger */
     bool                   bypass_proc_suspend; /* will still run if the process is suspended */

@@ -404,6 +404,9 @@ static inline void init_thread_structure( struct thread *thread )
     thread->unix_pid        = -1;  /* not known yet */
     thread->unix_tid        = -1;  /* not known yet */
     thread->context         = NULL;
+    thread->termination_context = 0;
+    thread->termination_target = NULL;
+    thread->termination_owner = NULL;
     thread->teb             = 0;
     thread->entry_point     = 0;
     thread->system_regs     = 0;
@@ -448,7 +451,7 @@ static inline void init_thread_structure( struct thread *thread )
 static inline int is_thread_suspended( struct thread *thread )
 {
     if (thread->context && thread->context->cooperative) return 0;
-    if (thread->suspend) return 1;
+    if (thread->suspend || thread->termination_owner) return 1;
     return !thread->bypass_proc_suspend && thread->process->suspend;
 }
 
@@ -607,12 +610,31 @@ static struct list *thread_get_kernel_obj_list( struct object *obj )
     return &thread->kernel_object;
 }
 
+/* Only the preparing thread owns this stop; ordinary ResumeThread cannot
+ * consume it. Clear both links before waking or dropping the target reference. */
+static void cancel_thread_termination( struct thread *owner )
+{
+    struct thread *target = owner->termination_target;
+    if (!target) return;
+    owner->termination_target = NULL;
+    if (owner->termination_context)
+    {
+        close_handle( owner->process, owner->termination_context );
+        owner->termination_context = 0;
+    }
+    assert( target->termination_owner == owner );
+    target->termination_owner = NULL;
+    if (target->state != TERMINATED && !is_thread_suspended( target )) wake_thread( target );
+    release_object( target );
+}
+
 /* cleanup everything that is no longer needed by a dead thread */
 /* used by destroy_thread and kill_thread */
 static void cleanup_thread( struct thread *thread )
 {
     int i;
 
+    cancel_thread_termination( thread );
     cleanup_thread_completion( thread );
     if (thread->context)
     {
@@ -1815,6 +1837,69 @@ DECL_HANDLER(init_thread)
     set_thread_affinity( current, current->affinity );
 
     reply->suspend = (is_thread_suspended( current ) || current->context != NULL);
+}
+
+/* A private stop must not create a cycle whose members cannot return from
+ * their waits to cancel. Each edge pins its target until finish/cleanup. */
+static int termination_would_cycle( struct thread *owner, struct thread *target )
+{
+    for (; target; target = target->termination_target)
+        if (target == owner) return 1;
+    return 0;
+}
+
+/* Experimental same-process termination preparation. Authorization is the
+ * original THREAD_TERMINATE right; no public suspend/context rights are added. */
+DECL_HANDLER(prepare_thread_termination)
+{
+    struct thread *thread;
+    if (current->termination_target) { set_error( STATUS_DEVICE_BUSY ); return; }
+    if (!(thread = get_thread_from_handle( req->handle, THREAD_TERMINATE ))) return;
+    if (thread == current) reply->self = 1;
+    else if (thread->state == TERMINATED) set_error( STATUS_THREAD_IS_TERMINATING );
+    else if (native_machine != IMAGE_FILE_MACHINE_ARM64 ||
+             thread->process != current->process ||
+             current->process->machine != IMAGE_FILE_MACHINE_AMD64 || thread->is_system)
+        set_error( STATUS_NOT_SUPPORTED );
+    else if (thread->termination_owner) set_error( STATUS_DEVICE_BUSY );
+    else if (termination_would_cycle( current, thread )) set_error( STATUS_POSSIBLE_DEADLOCK );
+    else
+    {
+        current->termination_target = (struct thread *)grab_object( thread );
+        thread->termination_owner = current;
+        stop_thread( thread );
+        if (!thread->context)
+        {
+            cancel_thread_termination( current );
+            set_error( STATUS_NO_MEMORY );
+        }
+        else
+        {
+            reply->context = current->termination_context =
+                alloc_handle( current->process, thread->context, SYNCHRONIZE, 0 );
+            if (!reply->context) cancel_thread_termination( current );
+        }
+    }
+    release_object( thread );
+}
+
+DECL_HANDLER(finish_thread_termination)
+{
+    struct thread *thread = current->termination_target;
+    if (!thread) { set_error( STATUS_INVALID_DEVICE_STATE ); return; }
+    if (req->commit)
+    {
+        if (thread->state == TERMINATED) set_error( STATUS_THREAD_IS_TERMINATING );
+        else if (!thread->context || thread->context->status || thread->context->cooperative)
+            set_error( STATUS_INVALID_DEVICE_STATE );
+        else
+        {
+            thread->exit_code = req->exit_code;
+            kill_thread( thread, 1 );
+            cancel_terminating_thread_asyncs( thread );
+        }
+    }
+    cancel_thread_termination( current );
 }
 
 /* terminate a thread */
