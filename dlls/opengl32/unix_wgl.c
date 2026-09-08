@@ -1116,7 +1116,7 @@ BOOL wrap_wglDeleteContext( TEB *teb, HGLRC client_context )
 {
     const struct opengl_funcs *funcs = get_context_funcs( client_context );
     struct context *ctx = context_from_client_context( client_context );
-    funcs->p_context_destroy( &ctx->base );
+    if (!funcs->p_context_destroy( &ctx->base )) return FALSE;
     free_context( funcs, ctx );
     return TRUE;
 }

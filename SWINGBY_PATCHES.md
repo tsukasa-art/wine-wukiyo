@@ -319,3 +319,13 @@ creation remains limited by the reported feature level; this is not complete
 D3D11 support. Padded pitches, other formats, dynamic/3D/compressed textures,
 concurrency, memory pressure and performance remain outside this validation.
 This candidate is isolated and is not enabled in the accepted product runtime.
+
+## OpenGL context destruction failure propagation
+
+The Unix OpenGL wrapper now preserves its context when the driver rejects
+context destruction, returning failure to the PE caller instead of freeing
+the wrapper and reporting success. A source-extracted fault-injection harness
+covers rejection followed by a successful retry. This is a prerequisite for
+fallible share-group cleanup, not the cause of the observed Core/legacy sharing
+failure: the current macOS driver destroy callback always reports success.
+No profile separation or product activation is introduced by this change.
