@@ -53,6 +53,19 @@ BOOL wined3d_texture_can_use_pbo(const struct wined3d_texture *texture, const st
 
 static BOOL wined3d_texture_use_pbo(const struct wined3d_texture *texture, const struct wined3d_d3d_info *d3d_info)
 {
+    char staging_sysmem[2];
+
+    /* Opt-in ARM64EC experiment: reuse tracked system memory for the RGBA8
+     * readback shape verified by the isolated mapping probes.  Do not expose
+     * a driver-owned PBO pointer to the translated CPU or change its VM rules.
+     * Keep dynamic textures and other formats on their existing paths. */
+    if (texture->resource.type == WINED3D_RTYPE_TEXTURE_2D
+            && texture->resource.format->id == WINED3DFMT_R8G8B8A8_UNORM
+            && texture->resource.access == (WINED3D_RESOURCE_ACCESS_CPU | WINED3D_RESOURCE_ACCESS_MAP_R)
+            && GetEnvironmentVariableA("ORRERY_ARM64EC_STAGING_SYSMEM", staging_sysmem, sizeof(staging_sysmem)) == 1
+            && staging_sysmem[0] == '1')
+        return FALSE;
+
     if (!wined3d_texture_can_use_pbo(texture, d3d_info))
         return FALSE;
 

@@ -299,3 +299,23 @@ remain excluded. Public suspend counts are not consumed. These changes retain
 the existing opt-in defaults and require matching ntdll, provider, and server
 artifacts; providers without the optional completion export remain conservative.
 No claim is made for arbitrary external forced termination or product adoption.
+
+## Experimental ARM64EC RGBA8 readback staging
+
+`ORRERY_ARM64EC_STAGING_SYSMEM=1` opts into the existing system-memory map
+binding for read-only CPU staging of 2D `R8G8B8A8_UNORM` textures. Default is
+off; dynamic textures and other formats retain their existing selection.
+This original, narrowly gated compatibility experiment avoids returning a
+driver-owned PBO mapping to the translated CPU. It does not expand CPU VM
+permissions, modify the application's access flags, or claim a higher D3D
+feature level. Existing texture allocation, location copies, Map/Unmap and
+cleanup own the storage; no second mapping-lifetime manager is introduced.
+
+Same-binary on/off tests reproduce the translated read fault when off and
+correct readback with normal termination when on. Four RGBA8 dimensions
+(1x1, 7x5, 17x3, 65x9), eight cycles each, cover write/upload/readback/remap.
+D3D9 numerical rendering, media pixels and CPU64 smoke also pass. Shader
+creation remains limited by the reported feature level; this is not complete
+D3D11 support. Padded pitches, other formats, dynamic/3D/compressed textures,
+concurrency, memory pressure and performance remain outside this validation.
+This candidate is isolated and is not enabled in the accepted product runtime.
