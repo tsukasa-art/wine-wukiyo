@@ -1112,6 +1112,15 @@ static void free_context( const struct opengl_funcs *funcs, struct context *ctx 
     free( ctx );
 }
 
+NTSTATUS context_cleanup( void *args )
+{
+    struct context_cleanup_params *params = args;
+    const struct opengl_funcs *funcs = (const struct opengl_funcs *)(UINT_PTR)params->funcs;
+
+    params->ret = funcs->p_context_cleanup && funcs->p_context_cleanup( params->group, params->enter );
+    return STATUS_SUCCESS;
+}
+
 BOOL wrap_wglDeleteContext( TEB *teb, HGLRC client_context )
 {
     const struct opengl_funcs *funcs = get_context_funcs( client_context );
@@ -1285,6 +1294,22 @@ HGLRC wrap_wglCreateContextAttribsARB( TEB *teb, HDC hdc, HGLRC client_shared, c
         return 0;
     }
 
+    if (context->base.share_group && is_win64 && is_wow64())
+    {
+        /* The WOW64 buffer-name cache is still process-global. */
+        funcs->p_context_destroy( &context->base );
+        free_context( funcs, context );
+        RtlSetLastWin32Error( ERROR_NOT_SUPPORTED );
+        return 0;
+    }
+    if (client_shared && opengl_client_context_from_client( client_shared )->share_group != context->base.share_group)
+    {
+        funcs->p_context_destroy( &context->base );
+        free_context( funcs, context );
+        RtlSetLastWin32Error( ERROR_INVALID_OPERATION );
+        return 0;
+    }
+    opengl_client_context_from_client( client_context )->share_group = context->base.share_group;
     context->client = client_context;
     opengl_client_context_init( client_context, context, funcs );
     return client_context;

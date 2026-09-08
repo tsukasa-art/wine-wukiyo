@@ -1825,12 +1825,14 @@ print OUT "    unsigned int num_formats;\n";
 print OUT "    unsigned int num_onscreen_formats;\n";
 print OUT "};\n\n";
 
+print OUT "struct context_cleanup_params\n{\n    UINT64 funcs;\n    UINT64 group;\n    UINT enter;\n    BOOL ret;\n};\n\n";
 print OUT "enum unix_funcs\n";
 print OUT "{\n";
 print OUT "    unix_process_attach,\n";
 print OUT "    unix_thread_attach,\n";
 print OUT "    unix_process_detach,\n";
 print OUT "    unix_get_pixel_formats,\n";
+print OUT "    unix_context_cleanup,\n";
 foreach (sort keys %wgl_functions)
 {
     next if defined $manual_win_functions{$_};
@@ -2074,12 +2076,14 @@ foreach (sort keys %ext_functions)
     print OUT generate_unix_thunk($_, $ext_functions{$_}, 0, "ext");
 }
 
+print OUT "extern NTSTATUS context_cleanup( void *args );\n\n";
 print OUT "const unixlib_entry_t __wine_unix_call_funcs[] =\n";
 print OUT "{\n";
 print OUT "    process_attach,\n";
 print OUT "    thread_attach,\n";
 print OUT "    process_detach,\n";
 print OUT "    get_pixel_formats,\n";
+print OUT "    context_cleanup,\n";
 foreach (sort keys %wgl_functions)
 {
     next if defined $manual_win_functions{$_};
@@ -2127,6 +2131,7 @@ print OUT "    process_attach,\n";
 print OUT "    wow64_thread_attach,\n";
 print OUT "    wow64_process_detach,\n";
 print OUT "    wow64_get_pixel_formats,\n";
+print OUT "    context_cleanup,\n";
 foreach (sort keys %wgl_functions)
 {
     next if defined $manual_win_functions{$_};

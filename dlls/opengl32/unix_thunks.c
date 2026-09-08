@@ -30518,12 +30518,15 @@ static NTSTATUS ext_wglSwapIntervalEXT( void *args )
     return STATUS_SUCCESS;
 }
 
+extern NTSTATUS context_cleanup( void *args );
+
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     process_attach,
     thread_attach,
     process_detach,
     get_pixel_formats,
+    context_cleanup,
     wgl_wglCopyContext,
     wgl_wglDeleteContext,
     wgl_wglGetPixelFormat,
@@ -86840,6 +86843,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     wow64_thread_attach,
     wow64_process_detach,
     wow64_get_pixel_formats,
+    context_cleanup,
     wow64_wgl_wglCopyContext,
     wow64_wgl_wglDeleteContext,
     wow64_wgl_wglGetPixelFormat,

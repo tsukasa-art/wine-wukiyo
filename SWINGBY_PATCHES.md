@@ -329,3 +329,42 @@ covers rejection followed by a successful retry. This is a prerequisite for
 fallible share-group cleanup, not the cause of the observed Core/legacy sharing
 failure: the current macOS driver destroy callback always reports success.
 No profile separation or product activation is introduced by this change.
+
+## Experimental macOS OpenGL profile share groups
+
+`ORRERY_GL_PROFILE_GROUPS=1` separates native legacy and Core share roots on
+Apple's non-EGL driver path. The default remains the original single root.
+An opaque root identity follows each PE and Unix context. Explicit context
+sharing and PE object-table sharing reject mismatched roots before changing
+ownership. Roots are bounded to two process-lifetime contexts, like the prior
+process-lifetime global root; per-thread service contexts are released on
+thread cleanup. Core-root publication uses acquire reads and atomic exchange.
+
+Object cleanup temporarily selects a service context belonging to the owner
+root and the matching Unix function table, then restores the previous native
+context and table. This also covers a deleting thread that has never made a
+context current. The internal OpenGL driver version is bumped, and the added
+fixed-width cleanup call is kept in both the generator and native/WOW64 tables.
+Matching opengl32 PE variants, opengl32.so, win32u.so and winemac.so are required.
+The process-global WOW64 buffer cache remains unsupported for this mode and is
+rejected on context creation; actual i386 testing stops earlier at the current
+Unix-library load boundary and does not validate that rejection dynamically. No pre-change execution
+comparison establishes the origin of that i386 load failure.
+
+On ARM64, glGetString's five standard non-indexed strings are copied into
+PE-owned storage retained until context deletion. Direct x64 reads of the host
+GL_VERSION pointer faulted in an unchanged four-thread fixture; the same binary
+passes after this copy. Invalid enums retain GL errors. Stringi extension names
+already use PE storage. Other Wine renderer-string queries are not covered.
+
+Isolated x64 tests cover GL2.1/Core4.1 coexistence, duplicate texture/buffer
+names with different contents, incompatible sharing, creator-first deletion,
+foreign-thread deletion, 256 switches, and four workers with 64 Core cycles.
+Direct string reads, committed memory, repeated pointer identity, invalid enum,
+D3D9 numerical rendering, RGBA8 readback and default-off legacy lifetime pass.
+These are bounded tests, not arbitrary concurrent share/delete or OOM proof.
+D3D11 still reports FL9.3 and rejects the tested shaders: integer-mix and
+polygon-offset-clamp requirements remain unmet. CGL pbuffer creation also fails
+in a native ARM64 control and with this mode off, before profile sharing.
+Neither pbuffer support, 32-bit rendering, games nor product deployment is
+claimed. All changes remain in the isolated candidate.

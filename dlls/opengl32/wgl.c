@@ -522,6 +522,9 @@ struct context
 {
     struct opengl_client_context base;
     struct display_lists *lists;
+#if defined(__aarch64__) || defined(__arm64ec__)
+    GLubyte *strings[5]; /* PE-owned strings readable by translated clients */
+#endif
 };
 
 static struct context *context_from_opengl_client_context( struct opengl_client_context *base )
@@ -568,6 +571,9 @@ static void free_client_context( struct handle_entry *ptr )
     struct context *context = context_from_opengl_client_context( ptr->context );
 
     display_lists_release( context->lists );
+#if defined(__aarch64__) || defined(__arm64ec__)
+    for (unsigned int i = 0; i < ARRAY_SIZE(context->strings); i++) free( context->strings[i] );
+#endif
 
     free_handle( &contexts, ptr );
     free( context );
@@ -937,6 +943,7 @@ BOOL WINAPI wglDeleteContext( HGLRC handle )
 {
     TEB *teb = NtCurrentTeb();
     struct wglDeleteContext_params args = {.teb = teb};
+    struct context_cleanup_params cleanup = { .enter = TRUE };
     struct handle_entry *ptr;
     NTSTATUS status;
 
@@ -952,12 +959,33 @@ BOOL WINAPI wglDeleteContext( HGLRC handle )
         return FALSE;
     }
 
+    cleanup.funcs = ptr->context->unix_funcs;
+    cleanup.group = ptr->context->share_group;
+    if (cleanup.group && (UNIX_CALL( context_cleanup, &cleanup ) || !cleanup.ret)) return FALSE;
+
     if ((status = UNIX_CALL( wglDeleteContext, &args ))) WARN( "wglDeleteContext returned %#lx\n", status );
-    if (status || !args.ret) return FALSE;
+    if (status || !args.ret)
+    {
+        if (cleanup.group)
+        {
+            cleanup.enter = FALSE;
+            UNIX_CALL( context_cleanup, &cleanup );
+        }
+        return FALSE;
+    }
 
     /* make sure there's a (dummy) context before releasing and destroying display list objects */
-    if (!teb->glCurrentRC) wglMakeContextCurrentARB( NULL, NULL, NULL );
+    if (!cleanup.group && !teb->glCurrentRC) wglMakeContextCurrentARB( NULL, NULL, NULL );
     free_client_context( ptr );
+    if (cleanup.group)
+    {
+        cleanup.enter = FALSE;
+        if (UNIX_CALL( context_cleanup, &cleanup ) || !cleanup.ret)
+        {
+            WARN( "Failed to restore context after object cleanup\n" );
+            wglMakeContextCurrentARB( NULL, NULL, NULL );
+        }
+    }
     return TRUE;
 }
 
@@ -1012,6 +1040,11 @@ BOOL WINAPI wglShareLists( HGLRC src_handle, HGLRC dst_handle )
 
     if (!(src_context = context_from_handle( src_handle ))) return FALSE;
     if (!(dst_context = context_from_handle( dst_handle ))) return FALSE;
+    if (src_context->base.share_group != dst_context->base.share_group)
+    {
+        SetLastError( ERROR_INVALID_OPERATION );
+        return FALSE;
+    }
     if (ReadNoFence( &dst_context->lists->modified )) return FALSE;
 
     lists = display_lists_acquire( src_context->lists );
@@ -2740,6 +2773,36 @@ const GLubyte * WINAPI glGetString( GLenum name )
 #ifndef _WIN64
     if (args.ret != wow64_str) free( wow64_str );
     else if (args.ret) append_wow64_string( (char *)args.ret );
+#endif
+#if defined(__aarch64__) || defined(__arm64ec__)
+    if (!status && args.ret)
+    {
+        struct context *ctx = get_current_context();
+        unsigned int index;
+        size_t size;
+
+        switch (name)
+        {
+        case GL_VENDOR: index = 0; break;
+        case GL_RENDERER: index = 1; break;
+        case GL_VERSION: index = 2; break;
+        case GL_SHADING_LANGUAGE_VERSION: index = 3; break;
+        case GL_EXTENSIONS: index = 4; break;
+        default: return args.ret;
+        }
+        if (!ctx) return NULL;
+        if (!ctx->strings[index])
+        {
+            size = strlen( (const char *)args.ret ) + 1;
+            if (!(ctx->strings[index] = malloc( size )))
+            {
+                set_gl_error( GL_OUT_OF_MEMORY );
+                return NULL;
+            }
+            memcpy( ctx->strings[index], args.ret, size );
+        }
+        return ctx->strings[index];
+    }
 #endif
     return args.ret;
 }

@@ -25805,12 +25805,21 @@ struct get_pixel_formats_params
     unsigned int num_onscreen_formats;
 };
 
+struct context_cleanup_params
+{
+    UINT64 funcs;
+    UINT64 group;
+    UINT enter;
+    BOOL ret;
+};
+
 enum unix_funcs
 {
     unix_process_attach,
     unix_thread_attach,
     unix_process_detach,
     unix_get_pixel_formats,
+    unix_context_cleanup,
     unix_wglCopyContext,
     unix_wglDeleteContext,
     unix_wglGetPixelFormat,

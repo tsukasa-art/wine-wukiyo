@@ -72,6 +72,7 @@ struct opengl_client_context
 {
     struct HGLRC__              obj;            /* client object header */
     UINT64                      unix_handle;
+    UINT64                      share_group; /* opaque native share-root identity, zero on the default path */
     UINT64                      unix_funcs;
     DWORD                       current_tid;                            /* thread that the context is current in */
     GLenum                      last_error;
@@ -112,7 +113,7 @@ struct __GLsync
 #include "wine/gdi_driver.h"
 
 /* Wine internal opengl driver version, needs to be bumped upon opengl_funcs changes. */
-#define WINE_OPENGL_DRIVER_VERSION 38
+#define WINE_OPENGL_DRIVER_VERSION 39
 
 struct opengl_drawable;
 
@@ -120,6 +121,7 @@ struct opengl_context
 {
     HGLRC                       client_context;     /* client side context pointer */
     void                       *driver_private;     /* driver context / private data */
+    UINT64                      share_group;        /* process-lifetime native share root */
     int                         format;             /* pixel format of the context */
     struct opengl_drawable     *draw;               /* currently bound draw surface */
     struct opengl_drawable     *read;               /* currently bound read surface */
@@ -148,6 +150,7 @@ struct opengl_funcs
     BOOL (*p_context_flush)( struct opengl_context *context, void (*flush)(void), UINT flags );
     BOOL (*p_context_create)( struct opengl_context *context, HDC hdc, const int *attribs );
     BOOL (*p_context_destroy)( struct opengl_context *context );
+    BOOL (*p_context_cleanup)( UINT64 group, BOOL enter );
     BOOL (*p_pbuffer_create)( HDC hdc, int format, int width, int height, const int *attribs, HPBUFFERARB client_pbuffer );
     void *egl_handle;
 };

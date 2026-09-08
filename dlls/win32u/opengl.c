@@ -41,8 +41,11 @@ WINE_DEFAULT_DEBUG_CHANNEL(wgl);
 
 struct opengl_thread_data
 {
-    void                   *null_context;  /* dummy context when no client context is active */
-    struct opengl_drawable *null_surface;  /* dummy surface when no client context is active */
+    void *cleanup_table;
+    UINT64 cleanup_group;
+    BOOL cleanup_active;
+    void                   *null_context[2];  /* dummy context when no client context is active */
+    struct opengl_drawable *null_surface[2];  /* dummy surface when no client context is active */
 };
 
 static struct opengl_thread_data *get_opengl_thread_data(void)
@@ -78,6 +81,12 @@ static struct list devices_egl = LIST_INIT( devices_egl );
 static struct egl_platform display_egl;
 static struct opengl_funcs display_funcs;
 static void *global_context;
+static void *core_global_context;
+static BOOL profile_groups;
+static const int core_group_attribs[] = { WGL_CONTEXT_MAJOR_VERSION_ARB, 3,
+    WGL_CONTEXT_MINOR_VERSION_ARB, 2, WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+    WGL_CONTEXT_FLAGS_ARB, WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB, 0 };
+
 
 static BOOLEAN global_extensions[GL_EXTENSION_COUNT];
 static struct wgl_pixel_format *pixel_formats;
@@ -196,9 +205,13 @@ static BOOL opengl_drawable_swap( struct opengl_drawable *drawable )
 static BOOL make_null_context_current( struct opengl_drawable *drawable )
 {
     struct opengl_thread_data *data = get_opengl_thread_data();
+    struct opengl_context *context = NtCurrentTeb()->glContext;
+    UINT64 group = data->cleanup_active ? data->cleanup_group : context ? context->share_group : 0;
+    unsigned int index = group && group == (UINT_PTR)ReadPointerAcquire( &core_global_context );
+    void *root = index ? (void *)(UINT_PTR)group : global_context;
     int format;
 
-    if (!data->null_context)
+    if (!data->null_context[index])
     {
         for (format = 1; format <= formats_count; format++)
         {
@@ -208,14 +221,42 @@ static BOOL make_null_context_current( struct opengl_drawable *drawable )
             if (desc->pfd.cColorBits < 24) continue;
             break;
         }
-
         if (format > formats_count) return FALSE;
-        driver_funcs->p_context_create( format, global_context, NULL, &data->null_context );
-        if (driver_funcs->p_null_surface_create) driver_funcs->p_null_surface_create( format, &data->null_surface );
+        if (!driver_funcs->p_context_create( format, root, index ? core_group_attribs : NULL,
+                                             &data->null_context[index] )) return FALSE;
+        if (driver_funcs->p_null_surface_create)
+            driver_funcs->p_null_surface_create( format, &data->null_surface[index] );
     }
+    if (!drawable) drawable = data->null_surface[index];
+    return driver_funcs->p_make_current( drawable, drawable, data->null_context[index] );
+}
 
-    if (!drawable) drawable = data->null_surface;
-    return driver_funcs->p_make_current( drawable, drawable, data->null_context );
+static BOOL win32u_context_cleanup( UINT64 group, BOOL enter )
+{
+    struct opengl_thread_data *data = get_opengl_thread_data();
+    struct opengl_context *context = NtCurrentTeb()->glContext;
+
+    if (!profile_groups || !group || (group != (UINT_PTR)global_context && group != (UINT_PTR)ReadPointerAcquire( &core_global_context )))
+        return FALSE;
+    if (enter)
+    {
+        if (data->cleanup_active) return FALSE;
+        data->cleanup_group = group;
+        data->cleanup_active = TRUE;
+        if (make_null_context_current( NULL ))
+        {
+            data->cleanup_table = NtCurrentTeb()->glTable;
+            NtCurrentTeb()->glTable = &display_funcs;
+            return TRUE;
+        }
+        data->cleanup_active = FALSE;
+        return FALSE;
+    }
+    if (!data->cleanup_active || data->cleanup_group != group) return FALSE;
+    data->cleanup_active = FALSE;
+    NtCurrentTeb()->glTable = data->cleanup_table;
+    if (context) return driver_funcs->p_make_current( context->draw, context->read, context->driver_private );
+    return make_null_context_current( NULL );
 }
 
 static void make_client_context_current(void)
@@ -2171,7 +2212,7 @@ static BOOL win32u_wglBindTexImageARB( HPBUFFERARB client_pbuffer, int buffer )
 
     funcs->p_glGetIntegerv( binding_from_target( pbuffer->texture_target ), &prev_texture );
 
-    make_null_context_current( pbuffer->drawable );
+    if (!make_null_context_current( pbuffer->drawable )) return FALSE;
 
     /* Make sure that the prev_texture is set as the current texture state isn't shared
      * between contexts. After that copy the pbuffer texture data. */
@@ -2274,6 +2315,7 @@ static int get_window_swap_interval( HWND hwnd )
 
 static BOOL win32u_context_create( struct opengl_context *context, HDC hdc, const int *attribs )
 {
+    void *root = global_context;
     int format;
 
     TRACE( "context %p, hdc %p, attribs %p\n", context, hdc, attribs );
@@ -2285,12 +2327,35 @@ static BOOL win32u_context_create( struct opengl_context *context, HDC hdc, cons
         else RtlSetLastWin32Error( ERROR_INVALID_HANDLE );
         return FALSE;
     }
-    if (!driver_funcs->p_context_create( format, global_context, attribs, &context->driver_private ))
+    if (profile_groups)
+    {
+        int major = 1;
+        const int *a;
+        for (a = attribs; a && a[0]; a += 2)
+            if (a[0] == WGL_CONTEXT_MAJOR_VERSION_ARB) major = a[1];
+        if (major >= 3)
+        {
+            /* Native validation still rejects unsupported versions and profiles. */
+            if (!(root = ReadPointerAcquire( &core_global_context )))
+            {
+                void *candidate = NULL, *previous;
+                if (!driver_funcs->p_context_create( format, NULL, core_group_attribs, &candidate )) return FALSE;
+                if ((previous = InterlockedCompareExchangePointer( &core_global_context, candidate, NULL )))
+                {
+                    driver_funcs->p_context_destroy( candidate );
+                    root = previous;
+                }
+                else root = candidate;
+            }
+        }
+    }
+    if (!driver_funcs->p_context_create( format, root, attribs, &context->driver_private ))
     {
         WARN( "Failed to create driver context for context %p\n", context );
         return FALSE;
     }
     context->format = format;
+    context->share_group = profile_groups ? (UINT_PTR)root : 0;
 
     TRACE( "created context %p, format %u for driver context %p\n", context, format, context->driver_private );
     return TRUE;
@@ -2705,6 +2770,7 @@ static void display_funcs_init(void)
     display_funcs.p_wglSwapBuffers = win32u_wglSwapBuffers;
     display_funcs.p_context_flush = win32u_context_flush;
     display_funcs.p_context_create = win32u_context_create;
+    display_funcs.p_context_cleanup = win32u_context_cleanup;
     display_funcs.p_context_destroy = win32u_context_destroy;
 
     global_extensions[WGL_ARB_multisample] = 1;
@@ -2782,6 +2848,12 @@ static void display_funcs_init(void)
             init_device_info( egl, &display_funcs );
     }
 
+#ifdef __APPLE__
+    {
+        const char *value = getenv( "ORRERY_GL_PROFILE_GROUPS" );
+        profile_groups = !display_egl.display && value && !strcmp( value, "1" );
+    }
+#endif
     if (!global_context)
     {
         for (int format = 1; format <= formats_count; format++)
@@ -2854,7 +2926,10 @@ void cleanup_opengl_thread(void)
     }
 
     if (!(data = info->opengl_data)) return;
-    if (data->null_context) driver_funcs->p_context_destroy( data->null_context );
-    if (data->null_surface) opengl_drawable_release( data->null_surface );
+    for (unsigned int i = 0; i < 2; i++)
+    {
+        if (data->null_context[i]) driver_funcs->p_context_destroy( data->null_context[i] );
+        if (data->null_surface[i]) opengl_drawable_release( data->null_surface[i] );
+    }
     free( data );
 }
